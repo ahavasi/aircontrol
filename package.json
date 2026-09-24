@@ -1,0 +1,53 @@
+{
+  "name": "aircontrol",
+  "version": "1.0.0",
+  "description": "Machine-local coordination for parallel Claude Code and Codex sessions — roster, claims, advisories, and turn-based messaging.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "codex",
+    "hooks",
+    "coordination",
+    "agents"
+  ],
+  "license": "MIT",
+  "author": "Andre Havasi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahavasi/aircontrol.git"
+  },
+  "homepage": "https://github.com/ahavasi/aircontrol#readme",
+  "bugs": {
+    "url": "https://github.com/ahavasi/aircontrol/issues"
+  },
+  "type": "commonjs",
+  "bin": {
+    "aircontrol": "coord.js",
+    "aircontrol-install": "install.js"
+  },
+  "files": [
+    "coord.js",
+    "codex-listener.js",
+    "cmux-codex-remote.sh",
+    "install.js",
+    "skills/"
+  ],
+  "scripts": {
+    "setup": "node install.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "dependencies": {
+    "ws": "8.21.3"
+  }
+}
