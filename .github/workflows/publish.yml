@@ -23,4 +23,4 @@ jobs:
       - run: npm install -g npm@latest
       - run: npm ci
       - run: npm test
-      - run: npm publish --provenance --access public
+      - run: npm -v && npm publish --provenance --access public --loglevel verbose
