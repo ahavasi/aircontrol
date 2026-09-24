@@ -22,4 +22,6 @@ node install.js        # install your working copy into ~/.claude and ~/.codex
 
 1. Bump `version` in `package.json` and commit.
 2. `git tag v<version> && git push origin v<version>`.
-3. The `publish` workflow runs the tests and publishes to npm with provenance.
+3. The `publish` workflow runs the tests and stages the version on npm with provenance.
+4. A maintainer approves it with 2FA: `npm stage list aircontrol`, then
+   `npm stage approve <stage-id>`, or approve it on npmjs.com.

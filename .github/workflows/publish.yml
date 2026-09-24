@@ -23,4 +23,6 @@ jobs:
       - run: npm install -g npm@latest
       - run: npm ci
       - run: npm test
-      - run: npm -v && npm publish --provenance --access public --loglevel verbose
+      # The trusted publisher is stage-only: a maintainer approves each version with 2FA
+      # (npm stage approve <id>, or on npmjs.com) before it goes live.
+      - run: npm -v && npm stage publish --provenance --access public --loglevel verbose
