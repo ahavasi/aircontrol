@@ -1,6 +1,6 @@
 {
   "name": "aircontrol",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Machine-local coordination for parallel Claude Code and Codex sessions — roster, claims, advisories, and turn-based messaging.",
   "keywords": [
     "claude",
