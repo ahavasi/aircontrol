@@ -44,8 +44,7 @@
     "linux"
   ],
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "dependencies": {
     "ws": "8.21.3"
