@@ -10,6 +10,9 @@ const path = require('path');
 const fs = require('fs');
 process.env.AIRCONTROL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-test-'));
 process.env.AIRCONTROL_DISABLE_LISTENER = '1';
+// `disk --prune` scans real /tmp by default; no test may ever reach it.
+process.env.AIRCONTROL_SESSION_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-sesstmp-'));
+process.env.AIRCONTROL_BUILD_TMP_ROOTS = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-buildtmp-'));
 
 const C = require('./coord.js');
 
@@ -3695,6 +3698,79 @@ test('disk --prune skips a folder under a live session claim', () => {
   const now = Date.now();
   C.writeSession(mkSession({ sessionId: 'peer-dd01', lastSeen: new Date(now).toISOString(), claims: { paths: ['/nonexistent/wt-claimed'], resources: [] } }));
   const out = captureStdout(() => C.cmdDisk({ prune: true }, now, { root, run: () => '0' }));
-  assert.match(out, /stale DerivedData: none/);
+  assert.match(out, /nothing stale/);
   assert.ok(fs.existsSync(path.join(root, 'App-claimed')));
+});
+
+function ageTree(p, ms) {
+  const t = new Date(ms);
+  const st = fs.lstatSync(p);
+  if (st.isDirectory()) for (const n of fs.readdirSync(p)) ageTree(path.join(p, n), ms);
+  fs.utimesSync(p, t, t);
+}
+
+function fakeTree(dir, files = ['Build/x', 'ModuleCache.noindex/m', 'scratch/a']) {
+  for (const f of files) {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), 'x');
+  }
+  return dir;
+}
+
+test('touchedSince finds a recent file deep in an old tree', () => {
+  const d = fakeTree(fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-touch-')), ['a/b/c/deep']);
+  const now = Date.now();
+  ageTree(d, now - 3 * 3600e3);
+  assert.equal(C.touchedSince(d, now - 3600e3), false);
+  fs.utimesSync(path.join(d, 'a/b/c/deep'), new Date(now), new Date(now));
+  assert.equal(C.touchedSince(d, now - 3600e3), true);
+});
+
+test('staleSessionTmp takes ended, idle session dirs only', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-st-'));
+  const now = Date.now();
+  const old = now - 2 * 3600e3;
+  for (const id of ['ended-old', 'ended-recent', 'has-record']) fakeTree(path.join(root, '-Users-x-proj', id));
+  fakeTree(path.join(root, 'rh-dd'));
+  ageTree(root, old);
+  fs.utimesSync(path.join(root, '-Users-x-proj', 'ended-recent', 'scratch', 'a'), new Date(now), new Date(now));
+  const got = C.staleSessionTmp(root, new Set(['has-record']), now, 3600e3).map((s) => path.basename(s.dir));
+  assert.deepEqual(got, ['ended-old']);
+});
+
+test('staleBuildRoots takes idle, unclaimed DerivedData-shaped dirs only', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-br-'));
+  const now = Date.now();
+  fakeTree(path.join(root, 'relay-dd'));
+  fakeTree(path.join(root, 'spm'), ['Build/x', 'SourcePackages/x']);
+  fakeTree(path.join(root, 'lsp'), ['build/x']);
+  fakeTree(path.join(root, 'spm-scratch'), ['workspace-state.json', 'checkouts/p/x']);
+  fakeTree(path.join(root, 'claimed-dd'));
+  fakeTree(path.join(root, 'fresh-dd'));
+  fakeTree(path.join(root, 'notes'), ['readme.txt']);
+  ageTree(root, now - 48 * 3600e3);
+  fs.utimesSync(path.join(root, 'fresh-dd', 'Build', 'x'), new Date(now), new Date(now));
+  const got = C.staleBuildRoots([root], [path.join(root, 'claimed-dd')], now, 24 * 3600e3).map((s) => path.basename(s.dir)).sort();
+  assert.deepEqual(got, ['relay-dd', 'spm', 'spm-scratch']);
+});
+
+test('disk --prune clears ended session tmp and idle build roots, keeps a recorded session', () => {
+  freshDataDir();
+  const now = Date.now();
+  const sessTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-dsess-'));
+  const buildRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-dbuild-'));
+  const dd = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-ddempty-'));
+  fakeTree(path.join(sessTmp, '-Users-x-proj', 'ended-1'));
+  fakeTree(path.join(sessTmp, '-Users-x-proj', 'peer-dd02'));
+  fakeTree(path.join(buildRoot, 'relay-dd'));
+  ageTree(sessTmp, now - 48 * 3600e3);
+  ageTree(buildRoot, now - 48 * 3600e3);
+  // Expired from the roster but not ended: it still owns its tmp dir.
+  C.writeSession(mkSession({ sessionId: 'peer-dd02', lastSeen: new Date(now - 5 * 3600e3).toISOString() }));
+  const out = captureStdout(() => C.cmdDisk({ prune: true }, now, { root: dd, sessionTmp: sessTmp, buildRoots: [buildRoot], run: () => '1024' }));
+  assert.match(out, /removed\t.*ended-1\t\(session ended\)/);
+  assert.match(out, /removed\t.*relay-dd\t\(build output, idle\)/);
+  assert.ok(!fs.existsSync(path.join(sessTmp, '-Users-x-proj', 'ended-1')));
+  assert.ok(fs.existsSync(path.join(sessTmp, '-Users-x-proj', 'peer-dd02')));
+  assert.ok(!fs.existsSync(path.join(buildRoot, 'relay-dd')));
 });

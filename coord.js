@@ -2922,7 +2922,7 @@ function cmdWorktrees(args, nowMs) {
 // leaves its own multi-GB folder behind after the worktree is deleted, and Xcode never
 // collects it. With several sessions cutting worktrees these fill a disk within a day, and
 // a full disk takes every session down at once: no tool can even create its temp dir.
-const DISK_DEFAULTS = { minFreeBytes: 20e9, minFreeRatio: 0.10 };
+const DISK_DEFAULTS = { minFreeBytes: 20e9, minFreeRatio: 0.10, sessionIdleMs: 60 * 60 * 1000, buildIdleMs: 24 * 60 * 60 * 1000 };
 
 function diskThresholds() {
   const out = { ...DISK_DEFAULTS };
@@ -2931,6 +2931,8 @@ function diskThresholds() {
     const d = (cfg && cfg.disk) || {};
     if (Number.isFinite(d.minFreeBytes) && d.minFreeBytes >= 0) out.minFreeBytes = d.minFreeBytes;
     if (Number.isFinite(d.minFreeRatio) && d.minFreeRatio >= 0) out.minFreeRatio = d.minFreeRatio;
+    if (Number.isFinite(d.sessionIdleMs) && d.sessionIdleMs >= 0) out.sessionIdleMs = d.sessionIdleMs;
+    if (Number.isFinite(d.buildIdleMs) && d.buildIdleMs >= 0) out.buildIdleMs = d.buildIdleMs;
   } catch {}
   return out;
 }
@@ -2991,23 +2993,118 @@ function dirBytes(dir, run = runQuiet) {
   return Number.isFinite(kb) ? kb * 1024 : 0;
 }
 
+// Claude Code gives every session a tmp dir (task output, scratchpad) under /tmp/claude-<uid>,
+// and builds pointed there with -derivedDataPath put multi-GB DerivedData in it. macOS clears
+// /tmp only on reboot, so on a machine that stays up these outlive their sessions by weeks.
+function sessionTmpRoot() {
+  return process.env.AIRCONTROL_SESSION_TMP ||
+    path.join('/tmp', `claude-${typeof process.getuid === 'function' ? process.getuid() : 0}`);
+}
+
+function buildTmpRoots() {
+  const env = process.env.AIRCONTROL_BUILD_TMP_ROOTS;
+  return env ? env.split(',').filter(Boolean) : [...new Set(['/tmp', sessionTmpRoot(), os.tmpdir()])];
+}
+
+/// True when anything under `dir` (including `dir`) was modified after `sinceMs`. Stops at
+/// the first hit; never follows symlinks, so a link out of the tree cannot mark it busy.
+function touchedSince(dir, sinceMs) {
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop();
+    let st;
+    try { st = fs.lstatSync(cur); } catch { continue; }
+    if (st.mtimeMs > sinceMs) return true;
+    if (!st.isDirectory()) continue;
+    let names;
+    try { names = fs.readdirSync(cur); } catch { continue; }
+    for (const n of names) stack.push(path.join(cur, n));
+  }
+  return false;
+}
+
+/// Per-session tmp dirs (`<root>/<project-slug>/<session-id>`) whose session has ended.
+/// "Ended" means no session record: SessionEnd deletes it. Expiry is not enough, because
+/// a session idle past the roster TTL is still running and still owns its scratchpad.
+function staleSessionTmp(root, recordIds, nowMs, idleMs = DISK_DEFAULTS.sessionIdleMs) {
+  const out = [];
+  let slugs;
+  try { slugs = fs.readdirSync(root).filter((n) => n.startsWith('-')); } catch { return []; }
+  for (const slug of slugs) {
+    let ids;
+    try { ids = fs.readdirSync(path.join(root, slug)); } catch { continue; }
+    for (const id of ids) {
+      const dir = path.join(root, slug, id);
+      if (recordIds.has(id)) continue;
+      try { if (!fs.lstatSync(dir).isDirectory()) continue; } catch { continue; }
+      if (touchedSince(dir, nowMs - idleMs)) continue;
+      out.push({ dir, why: 'session ended' });
+    }
+  }
+  return out;
+}
+
+// An Xcode -derivedDataPath root, or a SwiftPM --scratch-path / cloned-packages dir. Pairs,
+// not single names: macOS volumes are case-insensitive, so a lone `Build` check also matches
+// every unrelated tmp dir with a lowercase `build/` in it.
+const BUILD_ROOT_SHAPES = [
+  ['Build', 'ModuleCache.noindex'],
+  ['Build', 'SourcePackages'],
+  ['workspace-state.json', 'checkouts'],
+];
+
+function looksLikeBuildRoot(dir) {
+  if (!BUILD_ROOT_SHAPES.some(([first]) => fs.existsSync(path.join(dir, first)))) return false;
+  let names;
+  try { names = new Set(fs.readdirSync(dir)); } catch { return false; }
+  return BUILD_ROOT_SHAPES.some((shape) => shape.every((n) => names.has(n)));
+}
+
+/// Ad-hoc -derivedDataPath roots left directly in a tmp root. No session owns these, so
+/// they wait out a longer idle window, and a claimed path is never touched.
+function staleBuildRoots(roots, claimedPaths, nowMs, idleMs = DISK_DEFAULTS.buildIdleMs) {
+  const out = [];
+  for (const root of roots) {
+    let names;
+    try { names = fs.readdirSync(root); } catch { continue; }
+    for (const name of names) {
+      const dir = path.join(root, name);
+      if (!looksLikeBuildRoot(dir)) continue;
+      const real = (() => { try { return fs.realpathSync(dir); } catch { return dir; } })();
+      if (claimedPaths.some((p) => pathsOverlap(dir, p) || pathsOverlap(real, p))) continue;
+      if (touchedSince(dir, nowMs - idleMs)) continue;
+      out.push({ dir, why: 'build output, idle' });
+    }
+  }
+  return out;
+}
+
 function cmdDisk(args, nowMs, deps = {}) {
   const usage = diskUsage(deps.volume);
   if (usage) console.log(`free: ${humanGB(usage.free)} of ${humanGB(usage.total)} (${Math.round((usage.free / usage.total) * 100)}%)`);
-  const claimed = readSessions()
+  const sessions = readSessions();
+  const claimed = sessions
     .filter((s) => !isExpired(s, nowMs))
     .flatMap((s) => ((s.claims && s.claims.paths) || []).map(expandUser));
-  const stale = staleDerivedData(deps.root || derivedDataRoot(), claimed);
-  if (!stale.length) { console.log('stale DerivedData: none'); return; }
+  const th = diskThresholds();
+  const stale = [
+    ...staleDerivedData(deps.root || derivedDataRoot(), claimed)
+      .map((s) => ({ dir: s.dir, label: path.basename(s.dir), why: `${s.workspace} is gone` })),
+    ...staleSessionTmp(deps.sessionTmp || sessionTmpRoot(), new Set(sessions.map((s) => s.sessionId)), nowMs, th.sessionIdleMs)
+      .map((s) => ({ ...s, label: s.dir })),
+    ...staleBuildRoots(deps.buildRoots || buildTmpRoots(), claimed, nowMs, th.buildIdleMs)
+      .map((s) => ({ ...s, label: s.dir })),
+  ];
+  if (!stale.length) { console.log('nothing stale'); return; }
   let total = 0;
   for (const s of stale) {
     const bytes = dirBytes(s.dir, deps.run);
     if (args.prune) {
       try { fs.rmSync(s.dir, { recursive: true, force: true }); }
-      catch (e) { console.log(`failed\t${path.basename(s.dir)}\t${e.message}`); continue; }
+      catch (e) { console.log(`failed\t${s.label}\t${e.message}`); continue; }
     }
     total += bytes;
-    console.log(`${args.prune ? 'removed' : 'stale'}\t${humanGB(bytes)}\t${path.basename(s.dir)}\t(${s.workspace} is gone)`);
+    console.log(`${args.prune ? 'removed' : 'stale'}\t${humanGB(bytes)}\t${s.label}\t(${s.why})`);
   }
   console.log(`${args.prune ? 'reclaimed' : 'reclaimable with --prune'}: ${humanGB(total)}`);
 }
@@ -4227,6 +4324,7 @@ function main() {
 
 module.exports = {
   renderDiskLine, diskUsage, staleDerivedData, derivedDataWorkspace, cmdDisk, DISK_DEFAULTS,
+  staleSessionTmp, staleBuildRoots, touchedSince,
   boundaryPrefix, pathsOverlap, isStale, isExpired, holdsClaims, mergeClaims, resolveIdPrefix, isSafeComponent,
   requireLiveSession,
   messageFilename, shortId, agoLabel, splitList, toolInputPaths, parseArgs, advisories,
