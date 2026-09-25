@@ -105,6 +105,9 @@ mid-build) or one under a path a live session has claimed.
 - **Unowned build output** directly in `/tmp`, `/tmp/claude-<uid>` or `$TMPDIR`: an Xcode
   DerivedData root (`Build` + `ModuleCache.noindex` or `SourcePackages`) or a SwiftPM scratch dir
   (`workspace-state.json` + `checkouts`), idle for 24 hours and not under a claimed path.
+- **Loose files** at the top of those same roots (build and test logs, screenshots, dumps): regular
+  files you own, untouched for 7 days, not `*.lock` / `*.pid`, and not a claimed path. One line
+  per root with the count and total size.
 
 It also **reports** (never removes) linked git worktrees that nobody is using: no live session
 in them, nothing uncommitted, nothing that exists on no remote, and no git activity for 7 days.
@@ -112,7 +115,7 @@ It checks every repo a session has ever worked in, from the activity log. A forg
 is where an agent's in-tree `-derivedDataPath build` quietly grows to 10 GB; the line prints its
 size and the `git worktree remove` command, and session-cleanup is where it normally goes.
 
-All windows are overridable: `{ "disk": { "sessionIdleMs": 3600000, "buildIdleMs": 86400000, "worktreeIdleMs": 604800000 } }`.
+All windows are overridable: `{ "disk": { "sessionIdleMs": 3600000, "buildIdleMs": 86400000, "looseFileIdleMs": 604800000, "worktreeIdleMs": 604800000 } }`.
 
 Naming the offender isn't the same as fixing it, so the line pairs it with a general,
 offender-keyed remediation (`remediationHint`, also appended to `retro`'s ranked list) —
