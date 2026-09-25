@@ -96,6 +96,18 @@ collects. `disk` lists the folders whose project no longer exists; `disk --prune
 It never touches a folder without a project path (Xcode's shared caches, or one being created
 mid-build) or one under a path a live session has claimed.
 
+`disk` also covers what macOS leaves in `/tmp` until the next reboot:
+
+- **Ended sessions' tmp dirs** (`/tmp/claude-<uid>/<project>/<session-id>`: task output and
+  scratchpad, often holding a `-derivedDataPath` build). "Ended" means the session has no
+  record, since SessionEnd deletes it. A session that has only gone quiet past the roster TTL
+  keeps its record and its dir. Taken once nothing inside has changed for 1 hour.
+- **Unowned build output** directly in `/tmp`, `/tmp/claude-<uid>` or `$TMPDIR`: an Xcode
+  DerivedData root (`Build` + `ModuleCache.noindex` or `SourcePackages`) or a SwiftPM scratch dir
+  (`workspace-state.json` + `checkouts`), idle for 24 hours and not under a claimed path.
+
+Both windows are overridable: `{ "disk": { "sessionIdleMs": 3600000, "buildIdleMs": 86400000 } }`.
+
 Naming the offender isn't the same as fixing it, so the line pairs it with a general,
 offender-keyed remediation (`remediationHint`, also appended to `retro`'s ranked list) —
 not a diagnosis of what happened this session, just which of three shapes it is:
@@ -268,7 +280,7 @@ installer — so they keep working in shells where `node` isn't on `PATH` (nvm, 
 | `ledger <add\|list\|show\|take\|drop\|note\|block\|unblock\|done> [--repo .\|all\|path] [--priority low\|normal\|high\|urgent] [--depends-on id1,id2] [--notes]` | Track open work across every repo on the machine. `list` prints titles and pointers; `--notes` or `show <id>` for the notes |
 | `handoff --session <me> --to <them> [--ledger-id id] [--note "…"]` | Transfer in-progress work: ledger ownership, claims, and a context note move to the recipient |
 | `worktrees [--others] [--session id]` | Which worktrees live sessions are sitting in |
-| `disk [--prune]` | Free space, plus Xcode DerivedData left behind by deleted worktrees; `--prune` removes it |
+| `disk [--prune]` | Free space, plus build output and session tmp dirs nothing owns any more (deleted worktrees' DerivedData, ended sessions' `/tmp` dirs, idle `/tmp` builds); `--prune` removes them |
 | `browsers [--kill-mine]` | Classify browser-MCP processes by session; reap only your own |
 | `retro [--session name\|id] [--file path] [--top N]` | Where this session's tokens actually went; a live session by name, a Claude transcript id, or a Codex rollout id |
 | `log [--date YYYY-MM-DD] [--days N] [--session name\|id] [--repo path\|.] [--json]` | Per-day history of what every session did |

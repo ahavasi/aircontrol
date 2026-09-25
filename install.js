@@ -588,7 +588,8 @@ ${delivery}
   than doing them.
 - **A \`disk:\` line means the volume is running out of space.** Act on it now: at 0 bytes free
   no tool can run, including the one that frees space. Run \`node ${cliPath} disk --prune\` first, which
-  removes only Xcode DerivedData whose worktree is gone. Tell the operator what it reclaimed,
+  removes only build output and tmp dirs nothing owns any more (DerivedData of deleted worktrees,
+  ended sessions' /tmp dirs, idle /tmp builds). Tell the operator what it reclaimed,
   and ask before deleting anything else (simulators, caches, runtimes).
 - **When a turn that did real work ends with nothing pending, the Stop hook offers
   the \`next-steps\` skill.** Pass the offer on in one line and finish the turn; do not
