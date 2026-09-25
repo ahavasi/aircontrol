@@ -1,4 +1,5 @@
 'use strict';
+require('./tmp-cleanup.js');
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');

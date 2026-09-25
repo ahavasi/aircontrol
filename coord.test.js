@@ -1,4 +1,5 @@
 'use strict';
+require('./tmp-cleanup.js');
 const test = require('node:test');
 const assert = require('node:assert');
 
@@ -3621,4 +3622,79 @@ test('peek prints the structure and never the value', () => {
   // A PEM body is redacted whole rather than line by line.
   const pem = C.redactText('-----BEGIN PRIVATE KEY-----\nMIGTAgEAMBMGByqGSM49\nAgEG\n-----END PRIVATE KEY-----');
   assert.doesNotMatch(pem, /MIGTAgEA/);
+});
+
+// --- disk ---
+
+function fakeDerivedData(root, name, workspace) {
+  const d = path.join(root, name);
+  fs.mkdirSync(d, { recursive: true });
+  if (workspace !== undefined) {
+    fs.writeFileSync(path.join(d, 'info.plist'),
+      `<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n\t<key>WorkspacePath</key>\n\t<string>${workspace}</string>\n</dict>\n</plist>\n`);
+  }
+  fs.writeFileSync(path.join(d, 'blob'), 'x');
+  return d;
+}
+
+test('renderDiskLine stays silent with room to spare', () => {
+  const th = { minFreeBytes: 20e9, minFreeRatio: 0.10 };
+  assert.equal(C.renderDiskLine({ free: 85e9, total: 494e9 }, undefined, th), '');
+  assert.equal(C.renderDiskLine(null, undefined, th), '');
+});
+
+test('renderDiskLine fires below either threshold and names the prune command', () => {
+  const th = { minFreeBytes: 20e9, minFreeRatio: 0.10 };
+  const byRatio = C.renderDiskLine({ free: 40e9, total: 494e9 }, '~/.claude/hooks/coord.js', th);
+  assert.match(byRatio, /^\[aircontrol\] disk: 40\.0 GB free \(8%\)/);
+  assert.match(byRatio, /`node ~\/\.claude\/hooks\/coord\.js disk` lists stale build output, `disk --prune` removes it$/);
+  assert.match(C.renderDiskLine({ free: 15e9, total: 100e9 }, undefined, th), /15\.0 GB free/);
+});
+
+test('renderInjection carries the disk line on the solo path', () => {
+  const out = C.renderInjection(mkSession({}), [], [], Date.parse('2026-07-16T12:00:00Z'), undefined, '', '', '[aircontrol] disk: 1.0 GB free (0%)');
+  assert.match(out, /no other sessions/);
+  assert.match(out, /\[aircontrol\] disk: 1\.0 GB free/);
+});
+
+test('staleDerivedData picks only folders whose project is gone and unclaimed', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-dd-'));
+  const live = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-ddlive-'));
+  fakeDerivedData(root, 'App-live', path.join(live, 'App.xcodeproj'));
+  fs.mkdirSync(path.join(live, 'App.xcodeproj'));
+  fakeDerivedData(root, 'App-gone', '/nonexistent/wt-gone/App.xcodeproj');
+  fakeDerivedData(root, 'App-claimed', '/nonexistent/wt-claimed/App.xcodeproj');
+  fakeDerivedData(root, 'App-escaped', '/nonexistent/a&amp;b/App.xcodeproj');
+  fakeDerivedData(root, 'ModuleCache.noindex');
+  const stale = C.staleDerivedData(root, ['/nonexistent/wt-claimed']);
+  assert.deepEqual(stale.map((s) => path.basename(s.dir)).sort(), ['App-escaped', 'App-gone']);
+  assert.equal(stale.find((s) => s.dir.endsWith('App-escaped')).workspace, '/nonexistent/a&b/App.xcodeproj');
+});
+
+test('disk --prune removes stale folders and leaves live ones', () => {
+  freshDataDir();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-ddprune-'));
+  const live = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-ddlive-'));
+  fs.mkdirSync(path.join(live, 'App.xcodeproj'));
+  fakeDerivedData(root, 'App-live', path.join(live, 'App.xcodeproj'));
+  fakeDerivedData(root, 'App-gone', '/nonexistent/wt-gone/App.xcodeproj');
+  const run = () => '2048\t/x\n';
+  const listed = captureStdout(() => C.cmdDisk({}, Date.now(), { root, run }));
+  assert.match(listed, /stale\t0\.0 GB\tApp-gone/);
+  assert.ok(fs.existsSync(path.join(root, 'App-gone')), 'listing alone must not delete');
+  const pruned = captureStdout(() => C.cmdDisk({ prune: true }, Date.now(), { root, run }));
+  assert.match(pruned, /removed\t.*App-gone/);
+  assert.ok(!fs.existsSync(path.join(root, 'App-gone')));
+  assert.ok(fs.existsSync(path.join(root, 'App-live')));
+});
+
+test('disk --prune skips a folder under a live session claim', () => {
+  freshDataDir();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-ddclaim-'));
+  fakeDerivedData(root, 'App-claimed', '/nonexistent/wt-claimed/App.xcodeproj');
+  const now = Date.now();
+  C.writeSession(mkSession({ sessionId: 'peer-dd01', lastSeen: new Date(now).toISOString(), claims: { paths: ['/nonexistent/wt-claimed'], resources: [] } }));
+  const out = captureStdout(() => C.cmdDisk({ prune: true }, now, { root, run: () => '0' }));
+  assert.match(out, /stale DerivedData: none/);
+  assert.ok(fs.existsSync(path.join(root, 'App-claimed')));
 });

@@ -78,6 +78,24 @@ cost is flat in session length: on a 68 MB transcript a full re-read takes ~218 
 incremental read takes ~0.02 ms. Its totals and its ranking are verified to match `retro`
 exactly — a divergence would show one number and bill another.
 
+### The disk line
+
+A full disk takes every session down at once: no tool can even create its temp directory,
+so the agent cannot run the command that would free space. The `disk:` line fires while
+there is still room to act, when free space on the session's volume drops below 20 GB or
+10%, whichever is larger. It costs one `statfs` per prompt and stays silent otherwise.
+Both limits are overridable in `~/.claude/agents/config.json`:
+
+```json
+{ "disk": { "minFreeBytes": 20000000000, "minFreeRatio": 0.1 } }
+```
+
+The usual cause on a Mac is Xcode DerivedData. Xcode keys it by project path, so every
+throwaway worktree a session builds in leaves a multi-GB folder behind that Xcode never
+collects. `disk` lists the folders whose project no longer exists; `disk --prune` removes them.
+It never touches a folder without a project path (Xcode's shared caches, or one being created
+mid-build) or one under a path a live session has claimed.
+
 Naming the offender isn't the same as fixing it, so the line pairs it with a general,
 offender-keyed remediation (`remediationHint`, also appended to `retro`'s ranked list) —
 not a diagnosis of what happened this session, just which of three shapes it is:
@@ -250,6 +268,7 @@ installer — so they keep working in shells where `node` isn't on `PATH` (nvm, 
 | `ledger <add\|list\|show\|take\|drop\|note\|block\|unblock\|done> [--repo .\|all\|path] [--priority low\|normal\|high\|urgent] [--depends-on id1,id2] [--notes]` | Track open work across every repo on the machine. `list` prints titles and pointers; `--notes` or `show <id>` for the notes |
 | `handoff --session <me> --to <them> [--ledger-id id] [--note "…"]` | Transfer in-progress work: ledger ownership, claims, and a context note move to the recipient |
 | `worktrees [--others] [--session id]` | Which worktrees live sessions are sitting in |
+| `disk [--prune]` | Free space, plus Xcode DerivedData left behind by deleted worktrees; `--prune` removes it |
 | `browsers [--kill-mine]` | Classify browser-MCP processes by session; reap only your own |
 | `retro [--session name\|id] [--file path] [--top N]` | Where this session's tokens actually went; a live session by name, a Claude transcript id, or a Codex rollout id |
 | `log [--date YYYY-MM-DD] [--days N] [--session name\|id] [--repo path\|.] [--json]` | Per-day history of what every session did |
