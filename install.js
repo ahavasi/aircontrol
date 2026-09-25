@@ -590,7 +590,8 @@ ${delivery}
   no tool can run, including the one that frees space. Run \`node ${cliPath} disk --prune\` first, which
   removes only build output and tmp dirs nothing owns any more (DerivedData of deleted worktrees,
   ended sessions' /tmp dirs, idle /tmp builds). Tell the operator what it reclaimed,
-  and ask before deleting anything else (simulators, caches, runtimes).
+  and ask before deleting anything else (simulators, caches, runtimes, and any \`idle worktree\`
+  it lists, which it reports but never removes).
 - **When a turn that did real work ends with nothing pending, the Stop hook offers
   the \`next-steps\` skill.** Pass the offer on in one line and finish the turn; do not
   invoke the skill or start planning off the back of it, because the offer is for the

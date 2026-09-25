@@ -3774,3 +3774,42 @@ test('disk --prune clears ended session tmp and idle build roots, keeps a record
   assert.ok(fs.existsSync(path.join(sessTmp, '-Users-x-proj', 'peer-dd02')));
   assert.ok(!fs.existsSync(path.join(buildRoot, 'relay-dd')));
 });
+
+function repoWithWorktrees() {
+  const main = tmpGitRepo('wtidle');
+  const bare = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-wtbare-')));
+  const g = (cwd, args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, stdio: 'pipe' });
+  g(bare, ['init', '-q', '--bare']);
+  g(main, ['remote', 'add', 'origin', bare]);
+  g(main, ['push', '-q', 'origin', 'develop']);
+  const wt = {};
+  for (const name of ['pushed', 'unpushed', 'dirty', 'live', 'recent']) {
+    wt[name] = `${main}-${name}`;
+    g(main, ['worktree', 'add', '-q', '-b', `b-${name}`, wt[name]]);
+  }
+  g(wt.unpushed, ['commit', '-q', '--allow-empty', '-m', 'local only']);
+  fs.writeFileSync(path.join(wt.dirty, 'wip.txt'), 'x');
+  const old = new Date(Date.now() - 10 * 86400e3);
+  for (const name of ['pushed', 'unpushed', 'dirty', 'live']) {
+    const gitDir = execFileSync('git', ['rev-parse', '--absolute-git-dir'], { cwd: wt[name], encoding: 'utf8' }).trim();
+    for (const f of ['index', 'HEAD', 'logs/HEAD']) { try { fs.utimesSync(path.join(gitDir, f), old, old); } catch {} }
+  }
+  return { main, wt };
+}
+
+test('idleWorktrees reports only clean, pushed, idle worktrees with no live session', () => {
+  const { main, wt } = repoWithWorktrees();
+  const got = C.idleWorktrees([path.join(main, '.git')], [wt.live], Date.now(), 7 * 86400e3);
+  assert.deepEqual(got.map((w) => w.dir), [wt.pushed]);
+  assert.equal(got[0].branch, 'b-pushed');
+  assert.ok(got[0].idleDays >= 9);
+});
+
+test('disk reports an idle worktree but --prune never removes it', () => {
+  freshDataDir();
+  const { main, wt } = repoWithWorktrees();
+  const dd = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-ddwt-'));
+  const out = captureStdout(() => C.cmdDisk({ prune: true }, Date.now(), { root: dd, repos: [path.join(main, '.git')] }));
+  assert.match(out, new RegExp(`idle worktree\\t.*\\t${wt.pushed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\t\\(b-pushed, clean and pushed`));
+  assert.ok(fs.existsSync(wt.pushed));
+});
