@@ -40,7 +40,7 @@ const SCAN_PRUNE_DIRS = new Set([
   'node_modules', 'DerivedData', 'Pods', '.build', 'build', 'dist',
   '.next', '.cache', 'vendor',
 ]);
-const BOOLEAN_ARGS = new Set(['repair', 'extra', 'mine', 'json', 'idle', 'assignable', 'others', 'global', 'dry-run', 'no-mirror-global', 'shutdown', 'keep-booted', 'notes']);
+const BOOLEAN_ARGS = new Set(['repair', 'extra', 'mine', 'json', 'idle', 'assignable', 'others', 'global', 'dry-run', 'no-mirror-global', 'shutdown', 'keep-booted', 'notes', 'prune']);
 // Resources compared only within one repo; everything else (sim:*, deploy:*, …)
 // is machine-global contention.
 const REPO_SCOPED_RESOURCES = new Set(['stash']);
@@ -355,13 +355,13 @@ function renderMessageLines(messages, nowMs) {
   return lines;
 }
 
-function renderInjection(self, others, messages, nowMs, cliPath = '~/.claude/hooks/coord.js', ledgerLine = '', budgetLine = '') {
+function renderInjection(self, others, messages, nowMs, cliPath = '~/.claude/hooks/coord.js', ledgerLine = '', budgetLine = '', diskLine = '') {
   const live = others.filter((o) => !isExpired(o, nowMs));
   if (live.length === 0 && messages.length === 0) {
     const solo = `[aircontrol] session ${friendlyName(self.sessionId)} — no other sessions active on this machine.`;
     // The solo path is the common case, and the case the retro data came from. The budget
     // line has to survive this early return or it never fires where it matters most.
-    return [solo, ledgerLine, budgetLine].filter(Boolean).join('\n');
+    return [solo, ledgerLine, budgetLine, diskLine].filter(Boolean).join('\n');
   }
   const lines = [`[aircontrol] You are session ${friendlyName(self.sessionId)}.`];
   const same = live.filter((o) => o.repo === self.repo);
@@ -386,6 +386,7 @@ function renderInjection(self, others, messages, nowMs, cliPath = '~/.claude/hoo
   }
   if (ledgerLine) lines.push(ledgerLine);
   if (budgetLine) lines.push(budgetLine);
+  if (diskLine) lines.push(diskLine);
   lines.push(`Coordination CLI: node ${cliPath} claim|release|send|who --session ${friendlyName(self.sessionId)} …`);
   return lines.join('\n');
 }
@@ -1483,7 +1484,9 @@ function cmdInject(input, nowMs, harness) {
       }
     } catch { ledgerLine = ''; }
   }
-  const context = renderInjection(s, others, inbox, nowMs, cliPath, ledgerLine, budgetLine);
+  let diskLine = '';
+  try { diskLine = renderDiskLine(diskUsage(s.worktree || os.homedir()), cliPath); } catch { diskLine = ''; }
+  const context = renderInjection(s, others, inbox, nowMs, cliPath, ledgerLine, budgetLine, diskLine);
   // Both harnesses take the same shape, and it is the quiet one. `additionalContext`
   // reaches the model without echoing the roster into the operator's terminal; bare stdout
   // is *printed as well as* injected, which put a block of coordination state in front of
@@ -2913,6 +2916,102 @@ function cmdWorktrees(args, nowMs) {
   }
 }
 
+// --- disk ---
+
+// Xcode keys DerivedData by project path, so every throwaway worktree a session builds in
+// leaves its own multi-GB folder behind after the worktree is deleted, and Xcode never
+// collects it. With several sessions cutting worktrees these fill a disk within a day, and
+// a full disk takes every session down at once: no tool can even create its temp dir.
+const DISK_DEFAULTS = { minFreeBytes: 20e9, minFreeRatio: 0.10 };
+
+function diskThresholds() {
+  const out = { ...DISK_DEFAULTS };
+  try {
+    const cfg = JSON.parse(fs.readFileSync(configFile(), 'utf8'));
+    const d = (cfg && cfg.disk) || {};
+    if (Number.isFinite(d.minFreeBytes) && d.minFreeBytes >= 0) out.minFreeBytes = d.minFreeBytes;
+    if (Number.isFinite(d.minFreeRatio) && d.minFreeRatio >= 0) out.minFreeRatio = d.minFreeRatio;
+  } catch {}
+  return out;
+}
+
+function derivedDataRoot() {
+  return process.env.AIRCONTROL_DERIVED_DATA ||
+    path.join(os.homedir(), 'Library', 'Developer', 'Xcode', 'DerivedData');
+}
+
+/// Free and total bytes on the volume holding `dir`, or null when it cannot be read.
+function diskUsage(dir = os.homedir()) {
+  try {
+    const s = fs.statfsSync(dir);
+    return { free: s.bavail * s.bsize, total: s.blocks * s.bsize };
+  } catch { return null; }
+}
+
+function humanGB(n) { return `${(n / 1e9).toFixed(1)} GB`; }
+
+/// One line, or nothing. It has to fire while there is still room to act: at 0 bytes free
+/// the session cannot run the command it names.
+function renderDiskLine(usage, cliPath = '~/.claude/hooks/coord.js', thresholds = diskThresholds()) {
+  if (!usage || !usage.total) return '';
+  const low = usage.free < thresholds.minFreeBytes || usage.free / usage.total < thresholds.minFreeRatio;
+  if (!low) return '';
+  const pct = Math.round((usage.free / usage.total) * 100);
+  return `[aircontrol] disk: ${humanGB(usage.free)} free (${pct}%) — \`node ${cliPath} disk\` lists stale build output, \`disk --prune\` removes it`;
+}
+
+function derivedDataWorkspace(dir) {
+  try {
+    const xml = fs.readFileSync(path.join(dir, 'info.plist'), 'utf8');
+    const m = /<key>WorkspacePath<\/key>\s*<string>([^<]*)<\/string>/.exec(xml);
+    if (!m) return null;
+    return m[1].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  } catch { return null; }
+}
+
+/// DerivedData folders whose project no longer exists. A folder with no WorkspacePath is
+/// Xcode's shared module cache or one still being created mid-build, so it is never a
+/// candidate; neither is anything under a path a live session has claimed.
+function staleDerivedData(root, claimedPaths = []) {
+  let names;
+  try { names = fs.readdirSync(root); } catch { return []; }
+  const out = [];
+  for (const name of names) {
+    const dir = path.join(root, name);
+    const workspace = derivedDataWorkspace(dir);
+    if (!workspace || fs.existsSync(workspace)) continue;
+    if (claimedPaths.some((p) => pathsOverlap(workspace, p))) continue;
+    out.push({ dir, workspace });
+  }
+  return out;
+}
+
+function dirBytes(dir, run = runQuiet) {
+  const kb = parseInt(run('du', ['-sk', dir]) || '', 10);
+  return Number.isFinite(kb) ? kb * 1024 : 0;
+}
+
+function cmdDisk(args, nowMs, deps = {}) {
+  const usage = diskUsage(deps.volume);
+  if (usage) console.log(`free: ${humanGB(usage.free)} of ${humanGB(usage.total)} (${Math.round((usage.free / usage.total) * 100)}%)`);
+  const claimed = readSessions()
+    .filter((s) => !isExpired(s, nowMs))
+    .flatMap((s) => ((s.claims && s.claims.paths) || []).map(expandUser));
+  const stale = staleDerivedData(deps.root || derivedDataRoot(), claimed);
+  if (!stale.length) { console.log('stale DerivedData: none'); return; }
+  let total = 0;
+  for (const s of stale) {
+    const bytes = dirBytes(s.dir, deps.run);
+    if (args.prune) {
+      try { fs.rmSync(s.dir, { recursive: true, force: true }); }
+      catch (e) { console.log(`failed\t${path.basename(s.dir)}\t${e.message}`); continue; }
+    }
+    total += bytes;
+    console.log(`${args.prune ? 'removed' : 'stale'}\t${humanGB(bytes)}\t${path.basename(s.dir)}\t(${s.workspace} is gone)`);
+  }
+  console.log(`${args.prune ? 'reclaimed' : 'reclaimable with --prune'}: ${humanGB(total)}`);
+}
+
 // --- browsers ---
 
 // Claude Code names each session's Unix messaging socket <claudePid>.sock under this dir, so its
@@ -4094,6 +4193,7 @@ function main() {
     else if (cmd === 'handoff') cmdHandoff(args, nowMs);
     else if (cmd === 'sync') cmdSync(args, nowMs);
     else if (cmd === 'worktrees') cmdWorktrees(args, nowMs);
+    else if (cmd === 'disk') cmdDisk(args, nowMs);
     else if (cmd === 'browsers') cmdBrowsers(args);
     else if (cmd === 'tasks') cmdTasks(args);
     else if (cmd === 'retro') cmdRetro(args);
@@ -4108,7 +4208,7 @@ function main() {
       require(installer).main(process.argv.slice(2));
     }
     else {
-      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|ledger|handoff|worktrees|browsers|tasks|retro|log|skills|peek> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
+      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|ledger|handoff|worktrees|disk|browsers|tasks|retro|log|skills|peek> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
       console.error('       coord.js skills <status|link|unlink> [--repo path|--global] [--targets agents,grok] [--dry-run] [--json] — mirror .claude/skills into the dirs other harnesses read');
       console.error('       coord.js sim <list|acquire|release> [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
       console.error('       coord.js ledger <add|list|show|take|note|block|unblock|done|drop> [--repo .|all|path] [--title "…"] [--points-at ref] [--status …] [--priority low|normal|high|urgent] [--depends-on id1,id2] [--mine] [--notes] — list omits notes; show <id> prints them');
@@ -4126,6 +4226,7 @@ function main() {
 }
 
 module.exports = {
+  renderDiskLine, diskUsage, staleDerivedData, derivedDataWorkspace, cmdDisk, DISK_DEFAULTS,
   boundaryPrefix, pathsOverlap, isStale, isExpired, holdsClaims, mergeClaims, resolveIdPrefix, isSafeComponent,
   requireLiveSession,
   messageFilename, shortId, agoLabel, splitList, toolInputPaths, parseArgs, advisories,

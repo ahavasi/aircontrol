@@ -146,6 +146,15 @@ For each `[gone]` branch, in this order:
 3. Otherwise `git worktree remove <path>` — **without `--force`**. If it refuses, that refusal is
    information; report it rather than escalating.
 4. Only delete a branch whose worktree was actually removed. Never `-D` one that was skipped.
+5. Then reclaim the build output those worktrees left behind. Xcode never deletes a removed
+   worktree's DerivedData (several GB each), and nothing else will:
+
+   ```bash
+   node ~/.claude/hooks/coord.js disk --prune
+   ```
+
+   It removes only folders whose project path is gone and unclaimed, so it is safe with other
+   sessions live. Report the `reclaimed:` line.
 
 ## 5. Release aircontrol state
 
