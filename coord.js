@@ -2922,7 +2922,7 @@ function cmdWorktrees(args, nowMs) {
 // leaves its own multi-GB folder behind after the worktree is deleted, and Xcode never
 // collects it. With several sessions cutting worktrees these fill a disk within a day, and
 // a full disk takes every session down at once: no tool can even create its temp dir.
-const DISK_DEFAULTS = { minFreeBytes: 20e9, minFreeRatio: 0.10, sessionIdleMs: 60 * 60 * 1000, buildIdleMs: 24 * 60 * 60 * 1000 };
+const DISK_DEFAULTS = { minFreeBytes: 20e9, minFreeRatio: 0.10, sessionIdleMs: 60 * 60 * 1000, buildIdleMs: 24 * 60 * 60 * 1000, worktreeIdleMs: 7 * 24 * 60 * 60 * 1000 };
 
 function diskThresholds() {
   const out = { ...DISK_DEFAULTS };
@@ -2933,6 +2933,7 @@ function diskThresholds() {
     if (Number.isFinite(d.minFreeRatio) && d.minFreeRatio >= 0) out.minFreeRatio = d.minFreeRatio;
     if (Number.isFinite(d.sessionIdleMs) && d.sessionIdleMs >= 0) out.sessionIdleMs = d.sessionIdleMs;
     if (Number.isFinite(d.buildIdleMs) && d.buildIdleMs >= 0) out.buildIdleMs = d.buildIdleMs;
+    if (Number.isFinite(d.worktreeIdleMs) && d.worktreeIdleMs >= 0) out.worktreeIdleMs = d.worktreeIdleMs;
   } catch {}
   return out;
 }
@@ -3079,6 +3080,44 @@ function staleBuildRoots(roots, claimedPaths, nowMs, idleMs = DISK_DEFAULTS.buil
   return out;
 }
 
+/// Every repo a session has ever worked in, from the activity log plus current records.
+function knownRepos(sessions) {
+  const repos = new Set(sessions.map((s) => s.repo).filter(Boolean));
+  for (const e of readActivityEvents(readActivityFiles(Date.now(), { days: 100000 }))) if (e.repo) repos.add(e.repo);
+  return [...repos];
+}
+
+/// Linked worktrees nobody is using: no live session in them, nothing uncommitted, nothing
+/// that exists on no remote, and no git activity for a week. Reported, never removed: a
+/// worktree is somebody's work, not a cache. Build output left inside one (an agent's
+/// `-derivedDataPath build`) is how a forgotten worktree grows to 10 GB.
+function idleWorktrees(repos, busyPaths, nowMs, idleMs = DISK_DEFAULTS.worktreeIdleMs, run = runQuiet) {
+  const out = [];
+  const seen = new Set();
+  for (const repo of repos) {
+    const top = path.basename(repo) === '.git' ? path.dirname(repo) : repo;
+    const listing = run('git', ['-C', top, 'worktree', 'list', '--porcelain']);
+    if (!listing) continue;
+    const trees = listing.split('\n').filter((l) => l.startsWith('worktree ')).map((l) => l.slice(9));
+    for (const wt of trees.slice(1)) {
+      if (seen.has(wt) || !fs.existsSync(wt)) continue;
+      seen.add(wt);
+      if (busyPaths.some((p) => pathsOverlap(wt, p))) continue;
+      if ((run('git', ['-C', wt, 'status', '--porcelain']) ?? 'x').trim()) continue;
+      const unpushed = run('git', ['-C', wt, 'rev-list', '--count', 'HEAD', '--not', '--remotes']);
+      if (unpushed === null || Number(unpushed.trim()) > 0) continue;
+      const gitDir = (run('git', ['-C', wt, 'rev-parse', '--absolute-git-dir']) || '').trim();
+      const lastMs = Math.max(0, ...['index', 'HEAD', 'logs/HEAD'].map((f) => {
+        try { return fs.statSync(path.join(gitDir, f)).mtimeMs; } catch { return 0; }
+      }));
+      if (!gitDir || nowMs - lastMs < idleMs) continue;
+      const branch = (run('git', ['-C', wt, 'branch', '--show-current']) || '').trim() || 'detached';
+      out.push({ dir: wt, top, branch, idleDays: Math.floor((nowMs - lastMs) / 86400000) });
+    }
+  }
+  return out;
+}
+
 function cmdDisk(args, nowMs, deps = {}) {
   const usage = diskUsage(deps.volume);
   if (usage) console.log(`free: ${humanGB(usage.free)} of ${humanGB(usage.total)} (${Math.round((usage.free / usage.total) * 100)}%)`);
@@ -3095,6 +3134,11 @@ function cmdDisk(args, nowMs, deps = {}) {
     ...staleBuildRoots(deps.buildRoots || buildTmpRoots(), claimed, nowMs, th.buildIdleMs)
       .map((s) => ({ ...s, label: s.dir })),
   ];
+  const busy = [...claimed, ...sessions.map((s) => s.worktree).filter(Boolean)];
+  const idle = idleWorktrees(deps.repos || knownRepos(sessions), busy, nowMs, th.worktreeIdleMs, deps.run);
+  for (const w of idle) {
+    console.log(`idle worktree\t${humanGB(dirBytes(w.dir, deps.run))}\t${w.dir}\t(${w.branch}, clean and pushed, idle ${w.idleDays}d; remove with \`git -C ${w.top} worktree remove ${w.dir}\`)`);
+  }
   if (!stale.length) { console.log('nothing stale'); return; }
   let total = 0;
   for (const s of stale) {
@@ -4324,7 +4368,7 @@ function main() {
 
 module.exports = {
   renderDiskLine, diskUsage, staleDerivedData, derivedDataWorkspace, cmdDisk, DISK_DEFAULTS,
-  staleSessionTmp, staleBuildRoots, touchedSince,
+  staleSessionTmp, staleBuildRoots, touchedSince, idleWorktrees,
   boundaryPrefix, pathsOverlap, isStale, isExpired, holdsClaims, mergeClaims, resolveIdPrefix, isSafeComponent,
   requireLiveSession,
   messageFilename, shortId, agoLabel, splitList, toolInputPaths, parseArgs, advisories,
