@@ -3754,6 +3754,39 @@ test('staleBuildRoots takes idle, unclaimed DerivedData-shaped dirs only', () =>
   assert.deepEqual(got, ['relay-dd', 'spm', 'spm-scratch']);
 });
 
+test('staleLooseFiles takes idle, owned, unclaimed regular files at the top of a root only', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-lf-'));
+  const now = Date.now();
+  const old = new Date(now - 8 * 86400e3);
+  for (const n of ['build.log', 'shot.png', 'fresh.log', 'claimed.log', 'x.lock', 'y.pid']) fs.writeFileSync(path.join(root, n), 'abc');
+  fakeTree(path.join(root, 'somedir'), ['inner.log']);
+  fs.symlinkSync(path.join(root, 'build.log'), path.join(root, 'link.log'));
+  ageTree(root, now - 8 * 86400e3);
+  fs.lutimesSync(path.join(root, 'link.log'), old, old);
+  fs.utimesSync(path.join(root, 'fresh.log'), new Date(now), new Date(now));
+  const got = C.staleLooseFiles([root], [path.join(root, 'claimed.log')], now, 7 * 86400e3);
+  assert.equal(got.length, 1);
+  assert.deepEqual(got[0].files.map((f) => path.basename(f)).sort(), ['build.log', 'shot.png']);
+  assert.equal(got[0].bytes, 6);
+  assert.deepEqual(C.staleLooseFiles([root], [], now + 86400e3, 30 * 86400e3), []);
+});
+
+test('disk --prune removes idle loose files and keeps fresh ones', () => {
+  freshDataDir();
+  const now = Date.now();
+  const buildRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-dlf-'));
+  const sessTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-dlfs-'));
+  const dd = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-dlfdd-'));
+  fs.writeFileSync(path.join(buildRoot, 'old.log'), 'x');
+  fs.writeFileSync(path.join(buildRoot, 'new.log'), 'x');
+  const old = new Date(now - 8 * 86400e3);
+  fs.utimesSync(path.join(buildRoot, 'old.log'), old, old);
+  const out = captureStdout(() => C.cmdDisk({ prune: true }, now, { root: dd, sessionTmp: sessTmp, buildRoots: [buildRoot], repos: [], run: () => '0' }));
+  assert.match(out, /1 loose files, idle/);
+  assert.equal(fs.existsSync(path.join(buildRoot, 'old.log')), false);
+  assert.equal(fs.existsSync(path.join(buildRoot, 'new.log')), true);
+});
+
 test('disk --prune clears ended session tmp and idle build roots, keeps a recorded session', () => {
   freshDataDir();
   const now = Date.now();

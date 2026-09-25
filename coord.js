@@ -2922,7 +2922,7 @@ function cmdWorktrees(args, nowMs) {
 // leaves its own multi-GB folder behind after the worktree is deleted, and Xcode never
 // collects it. With several sessions cutting worktrees these fill a disk within a day, and
 // a full disk takes every session down at once: no tool can even create its temp dir.
-const DISK_DEFAULTS = { minFreeBytes: 20e9, minFreeRatio: 0.10, sessionIdleMs: 60 * 60 * 1000, buildIdleMs: 24 * 60 * 60 * 1000, worktreeIdleMs: 7 * 24 * 60 * 60 * 1000 };
+const DISK_DEFAULTS = { minFreeBytes: 20e9, minFreeRatio: 0.10, sessionIdleMs: 60 * 60 * 1000, buildIdleMs: 24 * 60 * 60 * 1000, looseFileIdleMs: 7 * 24 * 60 * 60 * 1000, worktreeIdleMs: 7 * 24 * 60 * 60 * 1000 };
 
 function diskThresholds() {
   const out = { ...DISK_DEFAULTS };
@@ -2933,6 +2933,7 @@ function diskThresholds() {
     if (Number.isFinite(d.minFreeRatio) && d.minFreeRatio >= 0) out.minFreeRatio = d.minFreeRatio;
     if (Number.isFinite(d.sessionIdleMs) && d.sessionIdleMs >= 0) out.sessionIdleMs = d.sessionIdleMs;
     if (Number.isFinite(d.buildIdleMs) && d.buildIdleMs >= 0) out.buildIdleMs = d.buildIdleMs;
+    if (Number.isFinite(d.looseFileIdleMs) && d.looseFileIdleMs >= 0) out.looseFileIdleMs = d.looseFileIdleMs;
     if (Number.isFinite(d.worktreeIdleMs) && d.worktreeIdleMs >= 0) out.worktreeIdleMs = d.worktreeIdleMs;
   } catch {}
   return out;
@@ -3080,6 +3081,33 @@ function staleBuildRoots(roots, claimedPaths, nowMs, idleMs = DISK_DEFAULTS.buil
   return out;
 }
 
+// Build and test logs, screenshots and dumps written straight into a tmp root are never inside
+// a session dir, so nothing else ever reclaims them. Grouped per root: there can be hundreds.
+function staleLooseFiles(roots, claimedPaths, nowMs, idleMs = DISK_DEFAULTS.looseFileIdleMs) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  const out = [];
+  for (const root of roots) {
+    let names;
+    try { names = fs.readdirSync(root); } catch { continue; }
+    const files = [];
+    let bytes = 0;
+    for (const name of names) {
+      if (/\.(lock|pid)$/.test(name)) continue;
+      const file = path.join(root, name);
+      let st;
+      try { st = fs.lstatSync(file); } catch { continue; }
+      if (!st.isFile()) continue;
+      if (uid !== null && st.uid !== uid) continue;
+      if (nowMs - st.mtimeMs < idleMs) continue;
+      if (claimedPaths.some((p) => pathsOverlap(file, p))) continue;
+      files.push(file);
+      bytes += st.size;
+    }
+    if (files.length) out.push({ dir: root, files, bytes, why: `${files.length} loose files, idle` });
+  }
+  return out;
+}
+
 /// Every repo a session has ever worked in, from the activity log plus current records.
 function knownRepos(sessions) {
   const repos = new Set(sessions.map((s) => s.repo).filter(Boolean));
@@ -3133,6 +3161,8 @@ function cmdDisk(args, nowMs, deps = {}) {
       .map((s) => ({ ...s, label: s.dir })),
     ...staleBuildRoots(deps.buildRoots || buildTmpRoots(), claimed, nowMs, th.buildIdleMs)
       .map((s) => ({ ...s, label: s.dir })),
+    ...staleLooseFiles(deps.buildRoots || buildTmpRoots(), claimed, nowMs, th.looseFileIdleMs)
+      .map((s) => ({ ...s, label: `${s.dir}/*` })),
   ];
   const busy = [...claimed, ...sessions.map((s) => s.worktree).filter(Boolean)];
   const idle = idleWorktrees(deps.repos || knownRepos(sessions), busy, nowMs, th.worktreeIdleMs, deps.run);
@@ -3142,10 +3172,12 @@ function cmdDisk(args, nowMs, deps = {}) {
   if (!stale.length) { console.log('nothing stale'); return; }
   let total = 0;
   for (const s of stale) {
-    const bytes = dirBytes(s.dir, deps.run);
+    const bytes = s.files ? s.bytes : dirBytes(s.dir, deps.run);
     if (args.prune) {
-      try { fs.rmSync(s.dir, { recursive: true, force: true }); }
-      catch (e) { console.log(`failed\t${s.label}\t${e.message}`); continue; }
+      try {
+        if (s.files) for (const f of s.files) fs.rmSync(f, { force: true });
+        else fs.rmSync(s.dir, { recursive: true, force: true });
+      } catch (e) { console.log(`failed\t${s.label}\t${e.message}`); continue; }
     }
     total += bytes;
     console.log(`${args.prune ? 'removed' : 'stale'}\t${humanGB(bytes)}\t${s.label}\t(${s.why})`);
@@ -4368,7 +4400,7 @@ function main() {
 
 module.exports = {
   renderDiskLine, diskUsage, staleDerivedData, derivedDataWorkspace, cmdDisk, DISK_DEFAULTS,
-  staleSessionTmp, staleBuildRoots, touchedSince, idleWorktrees,
+  staleSessionTmp, staleBuildRoots, staleLooseFiles, touchedSince, idleWorktrees,
   boundaryPrefix, pathsOverlap, isStale, isExpired, holdsClaims, mergeClaims, resolveIdPrefix, isSafeComponent,
   requireLiveSession,
   messageFilename, shortId, agoLabel, splitList, toolInputPaths, parseArgs, advisories,
