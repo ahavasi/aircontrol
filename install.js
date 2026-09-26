@@ -572,7 +572,9 @@ ${delivery}
 - **In a shared tree, HEAD is shared too.** \`git commit\` lands on whatever branch the last
   session checked out, so another session's work can arrive on your branch without either of
   you doing anything wrong. Run \`git branch --show-current\` before committing, and announce a
-  branch switch to the room before and after. Undoing a merge with \`git reset --hard\` strands
+  branch switch to the room before and after. While another live session works in the tree, never
+  \`checkout\`/\`checkout -b\` there: start your branch in a worktree off \`origin/<default>\` instead.
+  Undoing a merge with \`git reset --hard\` strands
   everything reachable only through the ref you move, not only what you noticed: check
   \`git log <target>..<current>\` first for what the move would lose, and
   \`git branch --contains <sha>\` after for each stranded commit. An orphaned one returns empty
