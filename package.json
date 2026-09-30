@@ -1,7 +1,7 @@
 {
   "name": "aircontrol",
   "version": "1.1.0",
-  "description": "Machine-local coordination for parallel Claude Code and Codex sessions — roster, claims, advisories, and turn-based messaging.",
+  "description": "Coordination for parallel Claude Code and Codex sessions, local and in the cloud: roster, claims, advisories, and messaging.",
   "keywords": [
     "claude",
     "claude-code",
@@ -30,7 +30,13 @@
     "codex-listener.js",
     "cmux-codex-remote.sh",
     "install.js",
-    "skills/"
+    "skills/",
+    "cloud-init.js",
+    "relay-admin.js",
+    "relay/room.js",
+    "relay/worker.mjs",
+    "relay/wrangler.toml.tmpl",
+    "relay/dev-server.js"
   ],
   "scripts": {
     "setup": "node install.js",

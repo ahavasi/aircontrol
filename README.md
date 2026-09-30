@@ -511,6 +511,55 @@ Auto-refresh is off by default. Turn it on in `~/.claude/agents/config.json`:
 
 `sweep` then fires a detached `cloud sync` at most every 5 minutes.
 
+### Two-way cloud coordination: the relay (opt-in)
+
+The mirrors above only go one way. With a **relay**, every participant (each of your
+machines and each cloud session) shares one roster, one set of claims and one message bus.
+Cloud sessions then see your local sessions, their claims block your edits and yours block
+theirs, and messages flow both ways.
+
+The relay is a small Cloudflare Worker with one Durable Object. It runs on **your own**
+Cloudflare account (the free tier is enough), so nothing passes through anyone else's
+service:
+
+```bash
+npx wrangler login              # once
+npx aircontrol relay deploy     # deploys, sets its admin secret, joins this machine
+npx aircontrol relay status
+```
+
+`relay deploy` stores the relay URL in `config.json` and this machine's token in
+`~/.claude/agents/relay-token` (mode 600). Other machines join with a token minted where
+you deployed: `npx aircontrol relay token add <machine> --out <file>`, then put that file at
+their `~/.claude/agents/relay-token` and the URL in their `config.json` (`"relay": {"url": "…"}`).
+A synced machine pushes its state every 20 seconds at most, from session hooks.
+
+**Claude Code cloud sessions.** In each repo, run `npx aircontrol cloud init` and commit the
+`.claude/settings.json` it writes. Its hooks run only when `CLAUDE_CODE_REMOTE=true`, so they
+never double up with your local hooks. At session start they install aircontrol in the VM
+(`~/.aircontrol/`), name the VM `cloud-<id>`, register and sync. Every prompt and every
+end of turn syncs again. The guard then denies edits on paths claimed anywhere in the same
+repo, matched by `origin` URL. Then configure the cloud environment:
+
+1. Environment variable `AIRCONTROL_RELAY_URL=<your relay URL>`.
+2. A token from `relay token add <env-name>`: as an API credential for the relay host where
+   your plan offers one (the session never sees it), otherwise as `AIRCONTROL_RELAY_TOKEN`.
+3. Network access **Custom**, with the relay host added.
+
+An idle cloud session runs no hooks, so when you `send` to one, aircontrol also queues a
+short follow-up through `claude -p … --cloud <id>` to wake it. Its prompt hook then delivers
+the message.
+
+**Codex Cloud (experimental).** Codex Cloud does not run hooks, so participation relies on the
+agent following instructions. `npx aircontrol cloud init --codex` adds a marked block to
+`AGENTS.md` telling the agent to run `aircontrol cloud join`, `claim`, `cloud inbox`, `send`
+and `cloud leave` at the right moments. Its claims are enforced on everyone else, but nothing
+enforces yours on it. In the environment, set `AIRCONTROL_RELAY_URL` and
+`AIRCONTROL_RELAY_TOKEN` as environment variables (Codex strips secrets before the agent
+runs), and allow the relay host in agent internet access with all HTTP methods.
+
+Any environment without hooks can take part the same way.
+
 ### Session cleanup
 
 Four agent sessions routinely share this machine, so cleanup has to be session-scoped or it
@@ -620,6 +669,7 @@ makes either machine-readable.
   | `[codex]` tag in `who` and the roster | — | ✓ |
   | background-task reaping (`tasks`) | ✓ | — (no shell snapshots to attribute) |
   | cloud sessions in roster (`cloud`) | ✓ tracked by hand; `send` delivers | ✓ polled from `codex cloud list`; no inbound messages |
+  | two-way relay (roster, enforced claims, messages) | ✓ cloud via repo hooks | ✓ locally; cloud via AGENTS.md (experimental) |
 
   Codex exposes no session-id env var, so every Codex hook command carries
   `--harness codex`; a session registered by an older hooks.json is still recognised by the
