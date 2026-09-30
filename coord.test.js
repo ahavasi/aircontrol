@@ -3873,3 +3873,122 @@ test('stripQuotedProse keeps whitespace-free quotes and leaves an unterminated q
   assert.equal(C.stripQuotedProse("echo it\\'s 'a b'"), "echo it\\'s  ");
   assert.equal(C.stripQuotedProse("cat 'open ended"), "cat 'open ended");
 });
+
+function quietLog(fn) {
+  const orig = console.log;
+  const lines = [];
+  console.log = (...a) => lines.push(a.join(' '));
+  try { fn(); } finally { console.log = orig; }
+  return lines.join('\n');
+}
+
+function codexMirror() {
+  try { return fs.readdirSync(path.join(C.remoteDir(C.CLOUD_CODEX), 'sessions')).sort(); } catch { return []; }
+}
+
+test('cloud sync mirrors active Codex tasks, drops terminal ones, and prunes vanished ones', () => {
+  freshDataDir();
+  const now = Date.now();
+  const list = (tasks) => ({ codexList: () => JSON.stringify({ tasks, cursor: null }) });
+  quietLog(() => C.cmdCloud({ _: ['cloud', 'sync'], codex: true }, now, list([
+    { id: 'task_a', title: 'Fix login', status: 'running', environment_label: 'me/app' },
+    { id: 'task_b', title: 'Old', status: 'ready' },
+    { id: 'task_c', title: 'Queued', status: { state: 'queued' } },
+    { id: '../evil', title: 'x', status: 'running' },
+  ])));
+  assert.deepEqual(codexMirror(), ['cx-task_a.json', 'cx-task_c.json']);
+  const rec = JSON.parse(fs.readFileSync(path.join(C.remoteDir(C.CLOUD_CODEX), 'sessions', 'cx-task_a.json'), 'utf8'));
+  assert.equal(rec.intent, 'Fix login');
+  assert.equal(rec.repo, 'me/app');
+  assert.equal(rec.cloud, true);
+  quietLog(() => C.cmdCloud({ _: ['cloud', 'sync'], codex: true }, now, list([{ id: 'task_c', status: 'running' }])));
+  assert.deepEqual(codexMirror(), ['cx-task_c.json']);
+});
+
+test('cloud sync keeps the last good Codex mirror when the CLI fails', () => {
+  freshDataDir();
+  const now = Date.now();
+  quietLog(() => C.cmdCloud({ _: ['cloud', 'sync'], codex: true }, now, { codexList: () => JSON.stringify({ tasks: [{ id: 't1', status: 'running' }] }) }));
+  const out = quietLog(() => C.cmdCloud({ _: ['cloud', 'sync'], codex: true }, now, { codexList: () => { throw new Error('not logged in'); } }));
+  assert.match(out, /codex: unavailable/);
+  assert.deepEqual(codexMirror(), ['cx-t1.json']);
+  assert.match(fs.readFileSync(path.join(process.env.AIRCONTROL_DIR, 'sync.log'), 'utf8'), /not logged in/);
+});
+
+test('cloud records expire by expiresAt, not the 30-minute heartbeat rule', () => {
+  const now = Date.now();
+  const rec = { cloud: true, lastSeen: new Date(now - 3 * 3600e3).toISOString(), expiresAt: new Date(now + 1000).toISOString() };
+  assert.equal(C.isExpired(rec, now), false);
+  assert.equal(C.isExpired(rec, now + 2000), true);
+  assert.equal(C.isExpired({ cloud: true }, now), true);
+});
+
+test('parseClaudeCloudId accepts ids and claude.ai/code URLs, rejects traversal', () => {
+  assert.equal(C.parseClaudeCloudId('session_01AbC'), 'session_01AbC');
+  assert.equal(C.parseClaudeCloudId('https://claude.ai/code/session_01AbC?x=1'), 'session_01AbC');
+  assert.equal(C.parseClaudeCloudId('cse_xyz'), 'cse_xyz');
+  assert.equal(C.parseClaudeCloudId('../x'), null);
+  assert.equal(C.parseClaudeCloudId(''), null);
+});
+
+test('cloud track/untrack round-trips a Claude session into who --json', () => {
+  freshDataDir();
+  const now = Date.now();
+  quietLog(() => C.cmdCloud({ _: ['cloud', 'track', 'https://claude.ai/code/session_abc'], intent: 'refactor auth' }, now));
+  const who = JSON.parse(quietLog(() => C.cmdWho(now, { json: true })));
+  const row = who.find((s) => s.sessionId === 'session_abc');
+  assert.ok(row);
+  assert.equal(row.machine, C.CLOUD_CLAUDE);
+  assert.equal(row.cloud, true);
+  assert.equal(row.assignable, false);
+  assert.equal(row.url, 'https://claude.ai/code/session_abc');
+  assert.match(quietLog(() => C.cmdWho(now, {})), /refactor auth" — tracked/);
+  quietLog(() => C.cmdCloud({ _: ['cloud', 'untrack', 'session_abc'] }, now));
+  assert.equal(JSON.parse(quietLog(() => C.cmdWho(now, { json: true }))).length, 0);
+});
+
+test('send reaches a Claude cloud session through claude --cloud and refuses Codex tasks', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('cloud-send');
+  const now = Date.now();
+  C.cmdRegister({ session_id: 'me-cloud1', cwd: repo }, now);
+  quietLog(() => C.cmdCloud({ _: ['cloud', 'track', 'session_zz'] }, now));
+  quietLog(() => C.cmdCloud({ _: ['cloud', 'sync'], codex: true }, now, { codexList: () => JSON.stringify({ tasks: [{ id: 'tk', status: 'running' }] }) }));
+  const sent = [];
+  quietLog(() => C.cmdSend({ _: ['send', 'rebase', 'now'], session: 'me-cloud1', to: 'session_zz' }, now, { claudeSend: (id, text) => sent.push([id, text]) }));
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][0], 'session_zz');
+  assert.match(sent[0][1], /^\[aircontrol message from .+\] rebase now$/);
+  assert.throws(() => C.cmdSend({ _: ['send', 'hi'], session: 'me-cloud1', to: 'cx-tk' }, now, { claudeSend: () => sent.push('x') }), /Codex Cloud task/);
+  assert.equal(sent.length, 1);
+  assert.equal(fs.existsSync(path.join(process.env.AIRCONTROL_DIR, 'outbox', 'cloud-claude')), false);
+});
+
+test('inject appends a cloud line and guard ignores cloud records', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('cloud-inj');
+  const now = Date.now();
+  quietLog(() => C.cmdCloud({ _: ['cloud', 'track', 'session_q'], intent: 'ship it', repo }, now));
+  const out = injectContext({ session_id: 'me-inj01', cwd: repo }, now);
+  assert.match(out, /\[aircontrol\] cloud: .+@cloud-claude "ship it" \(tracked\)/);
+  assert.equal(C.renderCloudLine(now + 25 * 3600e3), '');
+});
+
+test('cloud auto-refresh fires only when opted in, and is throttled', () => {
+  freshDataDir();
+  const now = Date.now();
+  const spawned = [];
+  const spawn = (file, argv) => spawned.push(argv.join(' '));
+  assert.equal(C.maybeAutoCloudSync(now, spawn), false);
+  writeSyncConfig({ cloud: { codex: true } });
+  assert.equal(C.maybeAutoCloudSync(now, spawn), true);
+  assert.equal(C.maybeAutoCloudSync(now + 1000, spawn), false);
+  assert.equal(spawned.length, 1);
+  assert.match(spawned[0], /cloud sync --codex$/);
+});
+
+test('a peer cannot be named after a cloud pseudo-machine', () => {
+  freshDataDir();
+  writeSyncConfig({ machine: 'mac', peers: [{ name: 'cloud-codex', host: 'h', dir: 'd' }, { name: 'box', host: 'h', dir: 'd' }] });
+  assert.deepEqual(C.syncConfig().peers.map((p) => p.name), ['box']);
+});

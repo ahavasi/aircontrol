@@ -40,7 +40,7 @@ const SCAN_PRUNE_DIRS = new Set([
   'node_modules', 'DerivedData', 'Pods', '.build', 'build', 'dist',
   '.next', '.cache', 'vendor',
 ]);
-const BOOLEAN_ARGS = new Set(['repair', 'extra', 'mine', 'json', 'idle', 'assignable', 'others', 'global', 'dry-run', 'no-mirror-global', 'shutdown', 'keep-booted', 'notes', 'prune']);
+const BOOLEAN_ARGS = new Set(['repair', 'extra', 'mine', 'json', 'idle', 'assignable', 'others', 'global', 'dry-run', 'no-mirror-global', 'shutdown', 'keep-booted', 'notes', 'prune', 'codex', 'claude']);
 // Resources compared only within one repo; everything else (sim:*, deploy:*, …)
 // is machine-global contention.
 const REPO_SCOPED_RESOURCES = new Set(['stash']);
@@ -82,6 +82,7 @@ function holdsClaims(session) {
 // session still counts. Roster, guard and sweep must agree on it, or the guard denies on
 // a session the roster does not show.
 function isExpired(session, nowMs) {
+  if (session && session.cloud) return !(nowMs < Date.parse(session.expiresAt));
   return holdsClaims(session)
     ? nowMs - Date.parse(session.lastSeen) >= CLAIM_TTL_MS
     : isStale(session, nowMs);
@@ -509,6 +510,7 @@ function sweep(nowMs) {
   const keepDays = activityRetentionDays(); // null = keep forever (the default)
   if (keepDays) { try { removed.activityFiles = pruneActivity(nowMs, keepDays); } catch {} }
   try { maybeAutoSync(nowMs); } catch {}
+  try { maybeAutoCloudSync(nowMs); } catch {}
   // A pull-only peer (no peers of its own, so it never runs `sync` itself)
   // still receives pushes into its mirror — deliver them on every sweep.
   try { importRemoteMessages(); } catch {}
@@ -1508,7 +1510,9 @@ function cmdInject(input, nowMs, harness) {
   }
   let diskLine = '';
   try { diskLine = renderDiskLine(diskUsage(s.worktree || os.homedir()), cliPath); } catch { diskLine = ''; }
-  const context = renderInjection(s, others, inbox, nowMs, cliPath, ledgerLine, budgetLine, diskLine);
+  let cloudLine = '';
+  try { cloudLine = renderCloudLine(nowMs); } catch { cloudLine = ''; }
+  const context = [renderInjection(s, others, inbox, nowMs, cliPath, ledgerLine, budgetLine, diskLine), cloudLine].filter(Boolean).join('\n');
   // Both harnesses take the same shape, and it is the quiet one. `additionalContext`
   // reaches the model without echoing the roster into the operator's terminal; bare stdout
   // is *printed as well as* injected, which put a block of coordination state in front of
@@ -1648,7 +1652,7 @@ function cmdRelease(args, nowMs) {
   }, nowMs);
 }
 
-function cmdSend(args, nowMs) {
+function cmdSend(args, nowMs, deps = {}) {
   const text = args._.slice(1).join(' ').trim();
   if (!text) throw new Error('no message text');
   const from = requireLiveSession(args, nowMs);
@@ -1664,6 +1668,7 @@ function cmdSend(args, nowMs) {
   }
   if (!targets.length) throw new Error('no recipients (no other live sessions)');
   for (const t of targets) {
+    if (CLOUD_MACHINES.has(t.machine)) { sendToCloud(t, from, text, deps); continue; }
     // A remote recipient's inbox lives on its own machine: stage the message in
     // the outbox for that machine and let `sync` carry it over.
     const dir = t.machine ? outboxDir(t.machine, t.sessionId) : messagesDir(t.sessionId);
@@ -1727,7 +1732,10 @@ function cmdWho(nowMs, args = {}) {
       claims: s.claims || { paths: [], resources: [] },
       recentPaths: s.recentPaths || [],
       lastSeen: s.lastSeen,
-      assignable: isAssignable(s),
+      cloud: !!s.cloud,
+      status: s.status || null,
+      url: s.url || null,
+      assignable: !s.cloud && isAssignable(s),
       idle: isAssignable(s), // deprecated alias for `assignable`; scripts reading it keep working
     })), null, 1));
     return;
@@ -1742,6 +1750,7 @@ function cmdWho(nowMs, args = {}) {
     console.log(repo);
     for (const s of ss) {
       const label = `${friendlyName(s.sessionId)}${s.machine ? `@${s.machine}` : ''}${harnessTag(s)}`;
+      if (s.cloud) { console.log(`  ${label} [${s.branch || '?'}] "${s.intent}" — ${s.status || '?'}${s.url ? ` ${s.url}` : ''}`); continue; }
       console.log(`  ${label} [${s.branch || '?'} @ ${path.basename(s.worktree)}] "${s.intent}" — claims: ${claimSummary(s)} (seen ${agoLabel(s.lastSeen, nowMs)})`);
     }
   }
@@ -2696,7 +2705,7 @@ function syncConfig() {
     const cfg = JSON.parse(fs.readFileSync(configFile(), 'utf8')) || {};
     return {
       machine: (cfg.machine && String(cfg.machine)) || fallback.machine,
-      peers: Array.isArray(cfg.peers) ? cfg.peers.filter((p) => p && isSafeComponent(p.name) && p.host && p.dir) : [],
+      peers: Array.isArray(cfg.peers) ? cfg.peers.filter((p) => p && isSafeComponent(p.name) && !String(p.name).startsWith('cloud-') && p.host && p.dir) : [],
       autoSync: cfg.autoSync === true,
     };
   } catch { return fallback; }
@@ -2877,6 +2886,246 @@ function maybeAutoSync(nowMs, spawnFn) {
     cp.unref();
   });
   spawn(process.execPath, [__filename, 'sync']);
+  return true;
+}
+
+// ---------- cloud sessions ----------
+//
+// Codex Cloud tasks and Claude Code cloud sessions run in remote VMs that never
+// load this machine's hooks, so they can't register themselves. They are
+// mirrored into two pseudo-machines under remote/ and inherit the display-only
+// treatment peer sessions already get: visible in `who` and the roster,
+// reachable by `send` where the harness allows, invisible to guard.
+//
+// Codex has a list API (`codex cloud list --json`), so its mirror is rebuilt
+// from each poll. Claude has no scriptable listing, so its records exist only
+// because someone ran `cloud track`; sync never invents a status for them.
+
+const CLOUD_CODEX = 'cloud-codex';
+const CLOUD_CLAUDE = 'cloud-claude';
+const CLOUD_MACHINES = new Set([CLOUD_CODEX, CLOUD_CLAUDE]);
+const CLOUD_SYNC_THROTTLE_MS = 5 * 60 * 1000;
+// A polled record outlives a few missed polls, then drops: a mirror nobody
+// refreshes must not keep a finished task on the roster forever.
+const CLOUD_CODEX_TTL_MS = 30 * 60 * 1000;
+const CLOUD_CLAUDE_TTL_MS = 24 * 60 * 60 * 1000;
+const CODEX_TERMINAL_STATUSES = new Set([
+  'ready', 'completed', 'complete', 'done', 'succeeded', 'success', 'applied',
+  'failed', 'error', 'errored', 'cancelled', 'canceled', 'archived', 'expired',
+]);
+
+function cloudConfig() {
+  try {
+    const c = (JSON.parse(fs.readFileSync(configFile(), 'utf8')) || {}).cloud || {};
+    return { codex: c.codex === true, claude: c.claude === true };
+  } catch { return { codex: false, claude: false }; }
+}
+
+function codexBinary() {
+  if (process.env.AIRCONTROL_CODEX_BINARY) return process.env.AIRCONTROL_CODEX_BINARY;
+  const managed = path.join(os.homedir(), '.codex', 'packages', 'standalone', 'current', 'codex');
+  return fs.existsSync(managed) ? managed : 'codex';
+}
+
+function defaultCloudDeps() {
+  return {
+    codexList: () => execFileSync(codexBinary(), ['cloud', 'list', '--json', '--limit', '20'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20000,
+    }),
+    claudeSend: (id, text) => execFileSync('claude', ['-p', text, '--cloud', id], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000,
+    }),
+  };
+}
+
+function cloudSessionsDir(machine) { return path.join(remoteDir(machine), 'sessions'); }
+
+function writeCloudRecord(machine, rec) {
+  const dir = cloudSessionsDir(machine);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${rec.sessionId}.json`);
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(rec, null, 1));
+  fs.renameSync(tmp, file);
+}
+
+function readCloudRecords(machine) {
+  let files = [];
+  try { files = fs.readdirSync(cloudSessionsDir(machine)); } catch { return []; }
+  const out = [];
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue;
+    try { out.push({ file: path.join(cloudSessionsDir(machine), f), rec: JSON.parse(fs.readFileSync(path.join(cloudSessionsDir(machine), f), 'utf8')) }); } catch {}
+  }
+  return out;
+}
+
+function pick(obj, ...keys) {
+  for (const k of keys) {
+    const v = k.split('.').reduce((o, p) => (o && typeof o === 'object' ? o[p] : undefined), obj);
+    if (v !== undefined && v !== null && v !== '') return v;
+  }
+  return undefined;
+}
+
+function codexTaskRecord(task, nowMs) {
+  if (!task || typeof task !== 'object') return null;
+  const rawId = pick(task, 'id', 'task_id', 'taskId');
+  if (rawId === undefined) return null;
+  const sessionId = `cx-${String(rawId)}`;
+  if (!isSafeComponent(sessionId)) return null;
+  let status = pick(task, 'status', 'state', 'task_status');
+  if (status && typeof status === 'object') status = pick(status, 'state', 'status', 'type');
+  status = String(status || 'unknown').toLowerCase();
+  if (CODEX_TERMINAL_STATUSES.has(status)) return null;
+  return {
+    sessionId,
+    harness: 'codex',
+    cloud: true,
+    cloudId: String(rawId),
+    status,
+    intent: String(pick(task, 'title', 'name', 'prompt', 'summary') || '(untitled task)').slice(0, 120),
+    repo: String(pick(task, 'environment_label', 'environment.label', 'environment.name', 'repo', 'repository') || 'codex-cloud'),
+    branch: pick(task, 'branch', 'environment.branch', 'base_branch') || null,
+    url: pick(task, 'url', 'task_url') || null,
+    claims: { paths: [], resources: [] },
+    lastSeen: new Date(nowMs).toISOString(),
+    expiresAt: new Date(nowMs + CLOUD_CODEX_TTL_MS).toISOString(),
+  };
+}
+
+function logCloud(nowMs, source, error) {
+  try {
+    fs.appendFileSync(syncLogFile(), JSON.stringify({
+      ts: new Date(nowMs).toISOString(), peer: source, error: String((error && error.message) || error).slice(0, 500),
+    }) + '\n');
+  } catch {}
+}
+
+function syncCodexCloud(nowMs, d) {
+  let parsed;
+  try {
+    parsed = JSON.parse(d.codexList());
+  } catch (e) {
+    // Unauthenticated, missing binary, or a network blip: keep the last good
+    // mirror and let its expiresAt age it out rather than blanking the roster.
+    logCloud(nowMs, CLOUD_CODEX, e);
+    return null;
+  }
+  const tasks = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.tasks) ? parsed.tasks : []);
+  const keep = new Set();
+  for (const t of tasks) {
+    const rec = codexTaskRecord(t, nowMs);
+    if (!rec) continue;
+    writeCloudRecord(CLOUD_CODEX, rec);
+    keep.add(`${rec.sessionId}.json`);
+  }
+  for (const { file } of readCloudRecords(CLOUD_CODEX)) {
+    if (!keep.has(path.basename(file))) { try { fs.unlinkSync(file); } catch {} }
+  }
+  return keep.size;
+}
+
+function pruneCloudClaude(nowMs) {
+  let n = 0;
+  for (const { file, rec } of readCloudRecords(CLOUD_CLAUDE)) {
+    if (isExpired(rec, nowMs)) { try { fs.unlinkSync(file); n++; } catch {} }
+  }
+  return n;
+}
+
+// Accepts a bare session id (session_… / cse_…) or any claude.ai/code URL that
+// carries one; the id becomes a filename, so it must survive isSafeComponent.
+function parseClaudeCloudId(ref) {
+  const s = String(ref || '').trim();
+  const m = s.match(/\b((?:session|cse)_[A-Za-z0-9_-]+)/);
+  const id = m ? m[1] : (/^[A-Za-z0-9_-]+$/.test(s) ? s : null);
+  return id && isSafeComponent(id) ? id : null;
+}
+
+function cmdCloud(args, nowMs, deps = {}) {
+  const sub = args._[1] || 'sync';
+  const d = { ...defaultCloudDeps(), ...deps };
+  ensureDirs();
+  if (sub === 'sync') {
+    const cfg = cloudConfig();
+    const want = args.codex || args.claude ? { codex: !!args.codex, claude: !!args.claude } : { codex: true, claude: true };
+    const parts = [];
+    if (want.codex) {
+      const n = syncCodexCloud(nowMs, d);
+      parts.push(n === null ? 'codex: unavailable (see sync.log)' : `codex: ${n} active`);
+    }
+    if (want.claude) parts.push(`claude: ${readCloudRecords(CLOUD_CLAUDE).length - pruneCloudClaude(nowMs)} tracked`);
+    if (!cfg.codex && !cfg.claude) parts.push('auto-refresh off (config.json cloud.codex/cloud.claude)');
+    console.log(`cloud sync: ${parts.join(', ')}`);
+    return;
+  }
+  if (sub === 'track') {
+    const id = parseClaudeCloudId(args._[2]);
+    if (!id) throw new Error('usage: cloud track <session_…|cse_…|claude.ai/code URL> [--intent "…"] [--repo name]');
+    const prev = readCloudRecords(CLOUD_CLAUDE).find((r) => r.rec.cloudId === id);
+    const rec = {
+      sessionId: id,
+      harness: 'claude',
+      cloud: true,
+      cloudId: id,
+      status: 'tracked',
+      intent: typeof args.intent === 'string' ? args.intent : (prev && prev.rec.intent) || '(cloud session)',
+      repo: typeof args.repo === 'string' ? args.repo : (prev && prev.rec.repo) || 'claude-cloud',
+      branch: (prev && prev.rec.branch) || null,
+      url: /^https?:\/\//.test(String(args._[2])) ? String(args._[2]) : `https://claude.ai/code/${id}`,
+      claims: { paths: [], resources: [] },
+      lastSeen: new Date(nowMs).toISOString(),
+      expiresAt: new Date(nowMs + CLOUD_CLAUDE_TTL_MS).toISOString(),
+    };
+    writeCloudRecord(CLOUD_CLAUDE, rec);
+    console.log(`tracking ${friendlyName(id)}@${CLOUD_CLAUDE} (${id}) for 24h — re-run track to extend`);
+    return;
+  }
+  if (sub === 'untrack') {
+    const ref = args._[2];
+    const recs = readCloudRecords(CLOUD_CLAUDE);
+    const ids = recs.map((r) => r.rec.sessionId);
+    const direct = parseClaudeCloudId(ref);
+    const id = ids.includes(direct) ? direct : resolveIdPrefix(ids, ref);
+    fs.unlinkSync(recs.find((r) => r.rec.sessionId === id).file);
+    console.log(`untracked ${friendlyName(id)}@${CLOUD_CLAUDE}`);
+    return;
+  }
+  throw new Error('usage: cloud <sync|track|untrack> …');
+}
+
+function sendToCloud(target, from, text, deps = {}) {
+  if (target.machine === CLOUD_CODEX) {
+    throw new Error(`${friendlyName(target.sessionId)} is a Codex Cloud task, which accepts no inbound messages — use \`codex cloud diff ${target.cloudId}\` / \`apply\``);
+  }
+  const d = { ...defaultCloudDeps(), ...deps };
+  d.claudeSend(target.cloudId || target.sessionId, `[aircontrol message from ${friendlyName(from.sessionId)}] ${text}`);
+}
+
+function renderCloudLine(nowMs, records) {
+  const live = (records || readRemoteSessions().filter((s) => CLOUD_MACHINES.has(s.machine)))
+    .filter((s) => !isExpired(s, nowMs));
+  if (!live.length) return '';
+  const shown = live.slice(0, 6).map((s) => `${friendlyName(s.sessionId)}@${s.machine} "${s.intent}" (${s.status || '?'})`);
+  const more = live.length > shown.length ? ` +${live.length - shown.length} more` : '';
+  return `[aircontrol] cloud: ${shown.join('; ')}${more}`;
+}
+
+function maybeAutoCloudSync(nowMs, spawnFn) {
+  const cfg = cloudConfig();
+  if (!cfg.codex && !cfg.claude) return false;
+  const marker = path.join(dataDir(), 'cloud.last');
+  try { if (nowMs - fs.statSync(marker).mtimeMs < CLOUD_SYNC_THROTTLE_MS) return false; } catch {}
+  try { fs.writeFileSync(marker, String(nowMs)); } catch { return false; }
+  const spawn = spawnFn || ((file, argv) => {
+    const cp = require('child_process').spawn(file, argv, { detached: true, stdio: 'ignore' });
+    cp.unref();
+  });
+  const argv = [__filename, 'cloud', 'sync'];
+  if (cfg.codex) argv.push('--codex');
+  if (cfg.claude) argv.push('--claude');
+  spawn(process.execPath, argv);
   return true;
 }
 
@@ -4387,6 +4636,7 @@ function main() {
     else if (cmd === 'ledger') cmdLedger(args, nowMs);
     else if (cmd === 'handoff') cmdHandoff(args, nowMs);
     else if (cmd === 'sync') cmdSync(args, nowMs);
+    else if (cmd === 'cloud') cmdCloud(args, nowMs);
     else if (cmd === 'worktrees') cmdWorktrees(args, nowMs);
     else if (cmd === 'disk') cmdDisk(args, nowMs);
     else if (cmd === 'browsers') cmdBrowsers(args);
@@ -4403,13 +4653,14 @@ function main() {
       require(installer).main(process.argv.slice(2));
     }
     else {
-      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|ledger|handoff|worktrees|disk|browsers|tasks|retro|log|skills|peek> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
+      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|ledger|handoff|cloud|worktrees|disk|browsers|tasks|retro|log|skills|peek> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
       console.error('       coord.js skills <status|link|unlink> [--repo path|--global] [--targets agents,grok] [--dry-run] [--json] — mirror .claude/skills into the dirs other harnesses read');
       console.error('       coord.js sim <list|acquire|release> [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
       console.error('       coord.js ledger <add|list|show|take|note|block|unblock|done|drop> [--repo .|all|path] [--title "…"] [--points-at ref] [--status …] [--priority low|normal|high|urgent] [--depends-on id1,id2] [--mine] [--notes] — list omits notes; show <id> prints them');
       console.error('       coord.js handoff --session <me> --to <them> [--ledger-id id] [--note "context for the recipient"]');
       console.error('       machine-readable: who [--assignable] --json · ledger list --json · sim list --json');
       console.error('       coord.js peek <file> [--keys] [--grep pattern] — print a config or env file with its secrets masked');
+      console.error('       coord.js cloud <sync [--codex] [--claude]|track <session_…|url> [--intent "…"] [--repo name]|untrack <id>> — show Codex Cloud tasks and Claude cloud sessions in the roster; `send` reaches Claude cloud sessions');
       console.error('       coord.js sync — mirror state with configured peers (config.json machine/peers/autoSync)');
       console.error('       coord.js log [--date YYYY-MM-DD] [--days N] [--session name|id] [--repo path|.] [--json] — per-day activity history');
       process.exit(1);
@@ -4458,6 +4709,8 @@ module.exports = {
   BUDGET_DEFAULTS, BUDGET_TOP_N, BUDGET_POOL, BUDGET_PENDING_MAX,
   ledgerFile, readLedgerEvents, appendLedgerEvent, ledgerId, foldLedger, ledgerView,
   suggestNextLedgerItem, cmdHandoff, LEDGER_STALE_MS,
+  cmdCloud, codexTaskRecord, parseClaudeCloudId, renderCloudLine, maybeAutoCloudSync, sendToCloud, cloudConfig,
+  CLOUD_CODEX, CLOUD_CLAUDE,
   syncConfig, repoUrlKey, gitOriginKey, remoteDir, outboxDir, readRemoteSessions,
   readRemoteLedgerEvents, readAllLedgerEvents, importRemoteMessages, quoteForRemoteShell, cmdSync, maybeAutoSync,
   compactLedger, ledgerCounts, renderLedgerLine, ledgerRepoFilter, formatLedgerItem, cmdLedger, sameRepo,
