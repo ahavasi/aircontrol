@@ -45,7 +45,12 @@ const BOOLEAN_ARGS = new Set(['repair', 'extra', 'mine', 'json', 'idle', 'assign
 // is machine-global contention.
 const REPO_SCOPED_RESOURCES = new Set(['stash']);
 
-function dataDir() { return process.env.AIRCONTROL_DIR || path.join(os.homedir(), '.claude', 'agents'); }
+// The copy `cloud bootstrap` installs at ~/.aircontrol/coord.js keeps its state
+// beside itself, so the CLI line shown to a cloud session works without env.
+function isCloudCopy() { return path.basename(__dirname) === '.aircontrol'; }
+function dataDir() {
+  return process.env.AIRCONTROL_DIR || (isCloudCopy() ? path.join(__dirname, 'state') : path.join(os.homedir(), '.claude', 'agents'));
+}
 
 // Every id that becomes a path component — session ids from hook stdin, ids
 // parsed out of PULLED remote mirrors, peer/machine names — must be a single
@@ -290,7 +295,10 @@ function detectHarness(input, explicit, prev) {
   return 'claude';
 }
 
-function cliPathFor(harness) { return harness === 'codex' ? '~/.codex/hooks/coord.js' : '~/.claude/hooks/coord.js'; }
+function cliPathFor(harness) {
+  if (isCloudCopy()) return '~/.aircontrol/coord.js';
+  return harness === 'codex' ? '~/.codex/hooks/coord.js' : '~/.claude/hooks/coord.js';
+}
 
 // Claude is the default and stays untagged; only the odd one out earns a label.
 function harnessTag(s) { return s && s.harness && s.harness !== 'claude' ? ` [${s.harness}]` : ''; }
@@ -370,13 +378,13 @@ function renderInjection(self, others, messages, nowMs, cliPath = '~/.claude/hoo
   if (same.length) {
     lines.push('Other sessions in THIS repo:');
     for (const o of same) {
-      lines.push(`- ${friendlyName(o.sessionId)}${harnessTag(o)} [${o.branch || '?'} @ ${path.basename(o.worktree)}] "${o.intent}" — claims: ${claimSummary(o)} (seen ${agoLabel(o.lastSeen, nowMs)})`);
+      lines.push(`- ${friendlyName(o.sessionId)}${o.machine ? `@${o.machine}` : ''}${harnessTag(o)} [${o.branch || '?'} @ ${path.basename(o.worktree)}] "${o.intent}" — claims: ${claimSummary(o)} (seen ${agoLabel(o.lastSeen, nowMs)})`);
     }
   }
   if (elsewhere.length) {
     lines.push('Elsewhere on this machine:');
     for (const o of elsewhere) {
-      lines.push(`- ${friendlyName(o.sessionId)}${harnessTag(o)} in ${path.basename(o.worktree)} [${o.branch || '?'}] "${o.intent}" (seen ${agoLabel(o.lastSeen, nowMs)})`);
+      lines.push(`- ${friendlyName(o.sessionId)}${o.machine ? `@${o.machine}` : ''}${harnessTag(o)} in ${path.basename(o.worktree)} [${o.branch || '?'}] "${o.intent}" (seen ${agoLabel(o.lastSeen, nowMs)})`);
     }
   }
   if (messages.length) lines.push(...renderMessageLines(messages, nowMs));
@@ -511,6 +519,7 @@ function sweep(nowMs) {
   if (keepDays) { try { removed.activityFiles = pruneActivity(nowMs, keepDays); } catch {} }
   try { maybeAutoSync(nowMs); } catch {}
   try { maybeAutoCloudSync(nowMs); } catch {}
+  try { maybeAutoRelaySync(nowMs); } catch {}
   // A pull-only peer (no peers of its own, so it never runs `sync` itself)
   // still receives pushes into its mirror — deliver them on every sweep.
   try { importRemoteMessages(); } catch {}
@@ -819,6 +828,12 @@ function readStdinJson() {
   } catch { return {}; }
 }
 
+function messageSender(filename) {
+  const parts = filename.replace(/\.md$/, '').split('-');
+  // Nonce segments contain a '.'; pre-nonce files (ts-sender only) don't.
+  return parts.slice(parts[1] && parts[1].includes('.') ? 2 : 1).join('-');
+}
+
 function readInbox(id) {
   const dir = messagesDir(id);
   let files = [];
@@ -826,9 +841,7 @@ function readInbox(id) {
   files.sort();
   return files.map((f) => {
     const ts = parseInt(f, 10);
-    const parts = f.replace(/\.md$/, '').split('-');
-    // Nonce segments contain a '.'; pre-nonce files (ts-sender only) don't.
-    const from = parts.slice(parts[1] && parts[1].includes('.') ? 2 : 1).join('-');
+    const from = messageSender(f);
     let text = '';
     try { text = fs.readFileSync(path.join(dir, f), 'utf8').trim(); } catch {}
     return { file: path.join(dir, f), at: new Date(Number.isFinite(ts) ? ts : 0).toISOString(), from, text };
@@ -949,6 +962,8 @@ function cmdRegister(input, nowMs, harness) {
     repo: g.repo,
     worktree: g.worktree,
     branch: g.branch,
+    repoKey: (prev && prev.worktree === g.worktree && prev.repoKey) || gitOriginKey(g.worktree),
+    cloudId: process.env.CLAUDE_CODE_REMOTE === 'true' ? id : (prev && prev.cloudId) || undefined,
     // Assigned once, on the first register, and kept: a session that renamed
     // itself mid-life would strand every message and ledger row already
     // addressed to the old name. A session that predates salts reads as salt 0,
@@ -1085,6 +1100,7 @@ function cmdDeregister(input, nowMs = Date.now(), deps = {}) {
     else releaseSessionLeases(id);
   } catch { try { releaseSessionLeases(id); } catch {} }
   try { fs.unlinkSync(sessionFile(id)); } catch {}
+  if (isCloudRuntime()) relaySyncQuiet(nowMs, 0);
   // SessionEnd also fires for /clear, where the session carries straight on — killing its
   // browsers there would pull the page out from under work still in progress. Only a real
   // ending reaps.
@@ -1359,6 +1375,8 @@ function computeGuardDecision(input, nowMs) {
   if (!isSafeComponent(id)) return { deny: false };
   const self = readSession(id);
   const others = readSessions().filter((o) => o.sessionId !== id && !isExpired(o, nowMs));
+  let remote = [];
+  try { remote = remoteClaimants(self, nowMs); } catch {}
 
   // Paths: deny only on overlap with another LIVE same-repo session's explicit
   // claim. recentPaths stay advisory — touching a file is not claiming it.
@@ -1366,14 +1384,14 @@ function computeGuardDecision(input, nowMs) {
     for (const fp of toolInputPaths(input)) {
       let rel = path.isAbsolute(fp) ? path.relative(self.worktree, fp) : fp;
       if (rel.startsWith('..')) rel = fp;
-      for (const o of others) {
-        if (o.repo !== self.repo) continue;
+      for (const o of [...others, ...remote]) {
+        if (!o.machine && o.repo !== self.repo) continue;
         for (const claim of (o.claims && o.claims.paths) || []) {
           if (pathsOverlap(claim, rel)) {
             return {
               deny: true,
               target: rel,
-              reason: `Path "${rel}" overlaps "${claim}", claimed by ${friendlyName(o.sessionId)} ("${o.intent}", last seen ${agoLabel(o.lastSeen, nowMs)}). Message them (\`coord.js send --to ${friendlyName(o.sessionId)}\`) or wait for their release; \`coord.js who\` shows the room. If they are plainly gone, \`coord.js release --session ${friendlyName(o.sessionId)}\` frees the claim.`,
+              reason: `Path "${rel}" overlaps "${claim}", claimed by ${friendlyName(o.sessionId)}${o.machine ? `@${o.machine}` : ''} ("${o.intent}", last seen ${agoLabel(o.lastSeen, nowMs)}). Message them (\`coord.js send --to ${friendlyName(o.sessionId)}\`) or wait for their release; \`coord.js who\` shows the room. If they are plainly gone, \`coord.js release --session ${friendlyName(o.sessionId)}\` frees the claim.`,
             };
           }
         }
@@ -1395,7 +1413,7 @@ function computeGuardDecision(input, nowMs) {
       const reason = guardResourceCheck('stash', self, others);
       if (reason) return { deny: true, target: 'stash', reason };
     } else if (m.kind === 'deploy' && self) {
-      const reason = guardDeployCheck(m.key || null, self, others);
+      const reason = guardDeployCheck(m.key || null, self, [...others, ...remote]);
       if (reason) return { deny: true, target: m.key ? `${DEPLOY_PREFIX}${m.key}` : 'deploy', reason };
     } else if (m.kind === 'secret-dump') {
       return {
@@ -1474,6 +1492,9 @@ function cmdInject(input, nowMs, harness) {
     existing = readSession(id);
     if (!existing) return;
   }
+  // One sync per prompt: prompts are rare, and a throttled pull here would show
+  // the session a roster and inbox from before its last idle stretch.
+  if (isCloudRuntime()) relaySyncQuiet(nowMs, 0);
   let ledgerPending = false;
   let budgetLine = '';
   const tp = payloadTranscript(input);
@@ -1481,6 +1502,7 @@ function cmdInject(input, nowMs, harness) {
   const s = updateSession(id, (cur) => {
     cur.lastSeen = new Date(nowMs).toISOString();
     if (harness) cur.harness = harness; // the installer's flag outranks whatever an older register inferred
+    if (cur.state === 'idle') cur.state = 'active';
     if (tp) cur.transcriptPath = tp; // only what the payload said — never the slug fallback
     ledgerPending = cur.ledgerPending !== false;
     cur.ledgerPending = false;
@@ -1494,7 +1516,7 @@ function cmdInject(input, nowMs, harness) {
     return cur;
   });
   if (!s) return;
-  const others = readSessions().filter((o) => o.sessionId !== id && !isExpired(o, nowMs));
+  const others = [...readSessions().filter((o) => o.sessionId !== id && !isExpired(o, nowMs)), ...relayRosterSessions(s, nowMs)];
   const inbox = readInbox(id);
   const cliPath = cliPathFor(detectHarness(input, harness, s));
   let ledgerLine = '';
@@ -1581,8 +1603,14 @@ function cmdStop(input, nowMs, harness, deps = {}) {
   if (input && input.stop_hook_active) return; // already inside our own continuation
   const id = input && input.session_id;
   if (!isSafeComponent(id)) return;
-  const s = readSession(id);
+  let s = readSession(id);
   if (!s) return; // unregistered: nothing addressed us, nothing to deliver
+  if (isCloudRuntime()) {
+    // Idle is what tells a sender to wake this session with a follow-up, since
+    // an idle cloud session runs no hooks until something prompts it.
+    s = updateSession(id, (cur) => { cur.state = 'idle'; return cur; }) || s;
+    relaySyncQuiet(nowMs, 0);
+  }
   const inbox = readInbox(id);
   if (!inbox.length) return offerNextSteps(id, s, deps); // no messages: maybe offer to plan what's next
   const msg = renderMessageLines(inbox, nowMs);
@@ -1607,8 +1635,9 @@ function requireLiveSession(args, nowMs) {
   return session;
 }
 
-function cmdClaim(args, nowMs) {
+function cmdClaim(args, nowMs, deps = {}) {
   const s0 = requireLiveSession(args, nowMs);
+  relayClaim(s0, splitList(args.paths), splitList(args.resources), args.intent, deps);
   const s = updateSession(s0.sessionId, (cur) => {
     if (args.intent) cur.intent = args.intent;
     cur.claims = mergeClaims(cur.claims, splitList(args.paths), splitList(args.resources));
@@ -1674,6 +1703,15 @@ function cmdSend(args, nowMs, deps = {}) {
     const dir = t.machine ? outboxDir(t.machine, t.sessionId) : messagesDir(t.sessionId);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, messageFilename(nowMs, from.sessionId)), text + '\n');
+  }
+  if (targets.some((t) => t.via === 'relay')) {
+    relaySyncQuiet(nowMs, 0, deps);
+    for (const t of targets) {
+      if (t.via !== 'relay' || t.state !== 'idle' || !t.cloudId || t.harness !== 'claude') continue;
+      try {
+        ({ ...defaultCloudDeps(), ...deps }).claudeSend(t.cloudId, `[aircontrol] ${friendlyName(from.sessionId)} sent you a message; it is in the aircontrol block of this prompt.`);
+      } catch (e) { process.stderr.write(`aircontrol: could not wake ${friendlyName(t.sessionId)}@${t.machine} (${e.message}); it will see the message on its next turn\n`); }
+    }
   }
   console.log(`sent to ${targets.map((t) => friendlyName(t.sessionId) + (t.machine ? `@${t.machine}` : '')).join(', ')}`);
   logActivity({
@@ -1743,8 +1781,9 @@ function cmdWho(nowMs, args = {}) {
   if (!live.length) { console.log(wantAssignable ? 'no assignable sessions' : 'no live sessions'); return; }
   const byRepo = new Map();
   for (const s of live) {
-    if (!byRepo.has(s.repo)) byRepo.set(s.repo, []);
-    byRepo.get(s.repo).push(s);
+    const key = s.repo || s.repoKey || `(${s.machine || 'unknown'})`;
+    if (!byRepo.has(key)) byRepo.set(key, []);
+    byRepo.get(key).push(s);
   }
   for (const [repo, ss] of byRepo) {
     console.log(repo);
@@ -3092,7 +3131,65 @@ function cmdCloud(args, nowMs, deps = {}) {
     console.log(`untracked ${friendlyName(id)}@${CLOUD_CLAUDE}`);
     return;
   }
-  throw new Error('usage: cloud <sync|track|untrack> …');
+  if (sub === 'join') return cloudJoin(args, nowMs, d);
+  if (sub === 'leave') return cloudLeave(nowMs, d);
+  if (sub === 'inbox') return cloudInbox(nowMs, d);
+  if (sub === 'init' || sub === 'bootstrap') return relayRequire('./cloud-init.js')[sub === 'init' ? 'cmdInit' : 'cmdBootstrap'](args, nowMs);
+  throw new Error('usage: cloud <sync|track|untrack|join|leave|inbox|init|bootstrap> …');
+}
+
+// ---------- hookless participation (Codex Cloud, or any agent without hooks) ----------
+//
+// An environment that runs no hooks can still take part by calling the CLI at
+// the moments hooks would have fired; AGENTS.md tells the agent when. The
+// session id it registers under is remembered in the data dir, so every later
+// command defaults --session to it.
+
+function selfSessionFile() { return path.join(dataDir(), 'self-session'); }
+function hooklessSession() {
+  try { const id = fs.readFileSync(selfSessionFile(), 'utf8').trim(); return isSafeComponent(id) ? id : null; } catch { return null; }
+}
+
+function cloudJoin(args, nowMs, d) {
+  ensureDirs();
+  let id = hooklessSession();
+  if (!id) {
+    const nonce = require('crypto').randomBytes(6).toString('hex');
+    id = `hookless-${nonce}`;
+    fs.writeFileSync(selfSessionFile(), id);
+    // A container's hostname says nothing useful and may repeat across tasks;
+    // name the machine after the session unless the user chose a name.
+    let cfg = {};
+    try { cfg = JSON.parse(fs.readFileSync(configFile(), 'utf8')) || {}; } catch {}
+    if (!cfg.machine && !process.env.AIRCONTROL_MACHINE) {
+      cfg.machine = `cloud-${nonce.slice(0, 8)}`;
+      fs.writeFileSync(configFile(), JSON.stringify(cfg, null, 1));
+    }
+  }
+  cmdRegister({ session_id: id, cwd: process.cwd() }, nowMs, args.harness || 'codex');
+  if (args.intent) updateSession(id, (cur) => { cur.intent = args.intent; return cur; });
+  relaySyncQuiet(nowMs, 0, d);
+  console.log(`joined as ${friendlyName(id)} (session ${id})`);
+  cmdWho(nowMs, {});
+}
+
+function cloudLeave(nowMs, d) {
+  const id = hooklessSession();
+  if (!id) { console.log('not joined'); return; }
+  cmdDeregister({ session_id: id }, nowMs);
+  relaySyncQuiet(nowMs, 0, d);
+  try { fs.unlinkSync(selfSessionFile()); } catch {}
+  console.log(`left: ${friendlyName(id)}`);
+}
+
+function cloudInbox(nowMs, d) {
+  const id = hooklessSession();
+  if (!id) throw new Error('run `cloud join` first');
+  relaySyncQuiet(nowMs, 0, d);
+  const inbox = readInbox(id);
+  if (!inbox.length) { console.log('no messages'); return; }
+  for (const line of renderMessageLines(inbox, nowMs)) console.log(line);
+  for (const m of inbox) { try { fs.renameSync(m.file, m.file + '.read'); } catch {} }
 }
 
 function sendToCloud(target, from, text, deps = {}) {
@@ -3127,6 +3224,267 @@ function maybeAutoCloudSync(nowMs, spawnFn) {
   if (cfg.claude) argv.push('--claude');
   spawn(process.execPath, argv);
   return true;
+}
+
+// ---------- relay (two-way cross-machine and cloud coordination) ----------
+//
+// A relay is a Cloudflare Worker the user deploys to their own account
+// (`relay deploy`; code in relay/). Every participant — each Mac, each cloud
+// session — is a "machine" that syncs its sessions, claims and outbound
+// messages with it. Relay machines land in the same remote/<machine>/ mirror
+// that ssh peers use, marked by a `.relay` file so a relay sync never deletes a
+// peer's or a polled cloud mirror. Unlike peer sessions, relay sessions carry a
+// `repoKey`, which is what lets the guard enforce their claims here.
+
+const RELAY_SYNC_THROTTLE_MS = 20 * 1000;
+
+function isCloudRuntime() { return process.env.CLAUDE_CODE_REMOTE === 'true' || process.env.AIRCONTROL_CLOUD === '1'; }
+
+function relayConfig() {
+  let cfg = {};
+  try { cfg = (JSON.parse(fs.readFileSync(configFile(), 'utf8')) || {}).relay || {}; } catch {}
+  const url = process.env.AIRCONTROL_RELAY_URL || cfg.url || null;
+  let token = process.env.AIRCONTROL_RELAY_TOKEN || null;
+  if (!token) { try { token = fs.readFileSync(path.join(dataDir(), 'relay-token'), 'utf8').trim() || null; } catch {} }
+  return { url: url ? String(url).replace(/\/+$/, '') : null, token };
+}
+
+function relayMachine() {
+  const m = process.env.AIRCONTROL_MACHINE || syncConfig().machine;
+  return isSafeComponent(m) ? m : 'unknown';
+}
+
+// Hooks are synchronous, so the request runs in a child node process. The token
+// travels in the child's env, never in argv where `ps` would show it. With no
+// token, the header is left off: Claude's cloud credential store attaches it to
+// matching outbound requests on its own.
+const RELAY_FETCH_SNIPPET = `
+let raw = ''; process.stdin.on('data', (c) => raw += c); process.stdin.on('end', async () => {
+  const q = JSON.parse(raw);
+  const headers = { 'content-type': 'application/json' };
+  if (process.env.AIRCONTROL_RELAY_BEARER) headers.authorization = 'Bearer ' + process.env.AIRCONTROL_RELAY_BEARER;
+  try {
+    const r = await fetch(q.url, { method: q.method, headers, body: q.body === undefined ? undefined : JSON.stringify(q.body), signal: AbortSignal.timeout(q.timeoutMs) });
+    const text = await r.text();
+    let body; try { body = JSON.parse(text); } catch { body = { error: text.slice(0, 300) }; }
+    process.stdout.write(JSON.stringify({ status: r.status, body }));
+  } catch (e) { process.stdout.write(JSON.stringify({ status: 0, body: { error: String(e && e.message || e) } })); }
+});`;
+
+function relayRequest(method, pathname, body, opts = {}) {
+  const { url, token } = opts.config || relayConfig();
+  if (!url) throw new Error('no relay configured (config.json relay.url or AIRCONTROL_RELAY_URL)');
+  const timeoutMs = opts.timeoutMs || 8000;
+  const env = { ...process.env };
+  delete env.AIRCONTROL_RELAY_BEARER;
+  const bearer = opts.token || token;
+  if (bearer) env.AIRCONTROL_RELAY_BEARER = bearer;
+  const out = execFileSync(process.execPath, ['-e', RELAY_FETCH_SNIPPET], {
+    input: JSON.stringify({ url: url + pathname, method, body, timeoutMs }),
+    env, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: timeoutMs + 3000,
+  });
+  const res = JSON.parse(out);
+  if (res.status < 200 || res.status >= 300) {
+    const e = new Error(`relay ${method} ${pathname}: ${res.status || 'unreachable'} ${(res.body && res.body.error) || ''}`.trim());
+    e.status = res.status;
+    throw e;
+  }
+  return res.body;
+}
+
+function relayMarker(machine) { return path.join(remoteDir(machine), '.relay'); }
+function relayAcksFile() { return path.join(dataDir(), 'relay-acks.json'); }
+
+function relaySessionRecord(s) {
+  return {
+    sessionId: s.sessionId,
+    harness: s.harness || 'claude',
+    repoKey: s.repoKey || (s.worktree ? gitOriginKey(s.worktree) : null),
+    repoName: s.worktree ? path.basename(s.worktree) : s.repoName,
+    branch: s.branch,
+    intent: s.intent,
+    claims: s.claims || { paths: [], resources: [] },
+    lastSeen: s.lastSeen,
+    state: s.state,
+    cloudId: s.cloudId,
+    nameSalt: Number.isInteger(s.nameSalt) ? s.nameSalt : 0,
+  };
+}
+
+function relayOutbox() {
+  const out = [];
+  let machines = [];
+  try { machines = fs.readdirSync(path.join(dataDir(), 'outbox')); } catch { return out; }
+  for (const m of machines) {
+    if (!fs.existsSync(relayMarker(m))) continue;
+    let sessions = [];
+    try { sessions = fs.readdirSync(outboxDir(m)); } catch { continue; }
+    for (const to of sessions) {
+      let files = [];
+      try { files = fs.readdirSync(outboxDir(m, to)); } catch { continue; }
+      for (const f of files) {
+        if (!f.endsWith('.md')) continue;
+        const id = f.slice(0, -3);
+        const from = messageSender(f);
+        let text = '';
+        try { text = fs.readFileSync(path.join(outboxDir(m, to), f), 'utf8').trim(); } catch { continue; }
+        out.push({ id, to, from, text, file: path.join(outboxDir(m, to), f) });
+      }
+    }
+  }
+  return out;
+}
+
+function relaySync(nowMs, deps = {}) {
+  const request = deps.request || relayRequest;
+  ensureDirs();
+  const machine = relayMachine();
+  const sessions = readSessions().filter((s) => !isExpired(s, nowMs)).map(relaySessionRecord);
+  let acks = [];
+  try { acks = JSON.parse(fs.readFileSync(relayAcksFile(), 'utf8')); } catch {}
+  const outbox = relayOutbox();
+  const res = request('POST', '/v1/sync', {
+    machine, sessions, ack: acks, outbox: outbox.map(({ id, to, from, text }) => ({ id, to, from, text })),
+  });
+
+  const undelivered = new Set(res.undelivered || []);
+  for (const m of outbox) if (!undelivered.has(m.id)) { try { fs.unlinkSync(m.file); } catch {} }
+
+  const byMachine = new Map();
+  for (const s of res.sessions || []) {
+    if (!isSafeComponent(s.machine) || !isSafeComponent(s.sessionId) || s.machine === machine) continue;
+    if (CLOUD_MACHINES.has(s.machine) || syncConfig().peers.some((p) => p.name === s.machine)) continue;
+    if (!byMachine.has(s.machine)) byMachine.set(s.machine, []);
+    byMachine.get(s.machine).push(s);
+  }
+  for (const m of remoteMachines()) {
+    if (fs.existsSync(relayMarker(m)) && !byMachine.has(m)) {
+      try { fs.rmSync(cloudSessionsDir(m), { recursive: true, force: true }); } catch {}
+    }
+  }
+  for (const [m, list] of byMachine) {
+    const dir = cloudSessionsDir(m);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(relayMarker(m), '');
+    const keep = new Set();
+    for (const s of list) {
+      const rec = { ...s, via: 'relay', worktree: s.repoName || s.machine };
+      delete rec.machine;
+      const file = path.join(dir, `${s.sessionId}.json`);
+      fs.writeFileSync(`${file}.tmp-${process.pid}`, JSON.stringify(rec, null, 1));
+      fs.renameSync(`${file}.tmp-${process.pid}`, file);
+      keep.add(`${s.sessionId}.json`);
+    }
+    for (const f of fs.readdirSync(dir)) if (!keep.has(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
+  }
+
+  const newAcks = [];
+  for (const msg of res.inbox || []) {
+    if (!isSafeComponent(msg.to) || !isSafeComponent(msg.id) || !readSession(msg.to)) continue;
+    const dest = path.join(messagesDir(msg.to), `${msg.id}.md`);
+    if (!fs.existsSync(dest) && !fs.existsSync(dest + '.read')) {
+      fs.mkdirSync(messagesDir(msg.to), { recursive: true });
+      fs.writeFileSync(dest, String(msg.text) + '\n');
+    }
+    newAcks.push(msg.id);
+  }
+  try { fs.writeFileSync(relayAcksFile(), JSON.stringify(newAcks)); } catch {}
+  try { fs.writeFileSync(path.join(dataDir(), 'relay.last'), String(nowMs)); } catch {}
+  return { sessions: [...byMachine.values()].reduce((n, l) => n + l.length, 0), inbox: newAcks.length, sent: outbox.length - undelivered.size };
+}
+
+// The safe wrapper every hook path uses: throttled, and silent on failure,
+// because a relay outage must never cost a session its prompt.
+function relaySyncQuiet(nowMs, throttleMs, deps = {}) {
+  if (!relayConfig().url) return false;
+  if (throttleMs > 0) {
+    try { if (nowMs - Number(fs.readFileSync(path.join(dataDir(), 'relay.last'), 'utf8')) < throttleMs) return false; } catch {}
+  }
+  try { relaySync(nowMs, deps); return true; } catch (e) { logCloud(nowMs, 'relay', e); return false; }
+}
+
+function maybeAutoRelaySync(nowMs, spawnFn) {
+  if (isCloudRuntime() || process.env.AIRCONTROL_RELAY_AUTOSYNC === '0' || !relayConfig().url) return false;
+  const marker = path.join(dataDir(), 'relay.spawned');
+  try { if (nowMs - fs.statSync(marker).mtimeMs < RELAY_SYNC_THROTTLE_MS) return false; } catch {}
+  try { fs.writeFileSync(marker, String(nowMs)); } catch { return false; }
+  const spawn = spawnFn || ((file, argv) => {
+    const cp = require('child_process').spawn(file, argv, { detached: true, stdio: 'ignore' });
+    cp.unref();
+  });
+  spawn(process.execPath, [__filename, 'relay', 'sync']);
+  return true;
+}
+
+// Every remote session whose claims this machine must honor: relay-mirrored
+// ones in the same repo, matched by origin URL since local paths differ.
+function remoteClaimants(self, nowMs) {
+  if (!self) return [];
+  const key = self.repoKey || (self.worktree ? gitOriginKey(self.worktree) : null);
+  return readRemoteSessions()
+    .filter((o) => o.via === 'relay' && !isExpired(o, nowMs) && holdsClaims(o))
+    // A path only means the same file when both sides are the same repo; a
+    // deploy target means the same thing everywhere.
+    .map((o) => (key && o.repoKey === key ? o : { ...o, claims: { paths: [], resources: o.claims.resources || [] } }));
+}
+
+// Relay sessions join the roster: same repo (by origin URL) groups with this
+// session's own repo, anything else lands under "elsewhere".
+function relayRosterSessions(self, nowMs) {
+  let remote = [];
+  try { remote = readRemoteSessions().filter((o) => o.via === 'relay' && !isExpired(o, nowMs)); } catch { return []; }
+  const key = self.repoKey || null;
+  return remote.map((o) => ({ ...o, repo: key && o.repoKey === key ? self.repo : `relay:${o.repoKey || o.machine}` }));
+}
+
+function relayClaim(s, paths, resources, intent, deps = {}) {
+  if (!relayConfig().url || (!paths.length && !resources.length)) return;
+  const request = deps.request || relayRequest;
+  let res;
+  try {
+    res = request('POST', '/v1/claim', {
+      machine: relayMachine(), sessionId: s.sessionId, repoKey: s.repoKey || (s.worktree ? gitOriginKey(s.worktree) : null),
+      paths, resources, intent,
+    });
+  } catch (e) {
+    process.stderr.write(`aircontrol: relay unreachable (${e.message}); claim recorded locally only\n`);
+    return;
+  }
+  if (res && res.ok === false && res.conflict) {
+    const c = res.conflict;
+    if (Number.isInteger(c.nameSalt)) saltCache.set(c.sessionId, c.nameSalt);
+    throw new Error(`"${c.mine}" overlaps "${c.claim}", claimed by ${friendlyName(c.sessionId)}@${c.machine} ("${c.intent}"). Message them (\`coord.js send --to ${friendlyName(c.sessionId)}\`) or wait for their release.`);
+  }
+}
+
+function cmdRelay(args, nowMs, deps = {}) {
+  const sub = args._[1] || 'status';
+  if (sub === 'sync') {
+    if (!relayConfig().url) { console.log('relay: not configured'); return; }
+    try {
+      const r = relaySync(nowMs, deps);
+      console.log(`relay sync: ${r.sessions} remote sessions, ${r.inbox} messages in, ${r.sent} out`);
+    } catch (e) { logCloud(nowMs, 'relay', e); console.log(`relay sync failed: ${e.message}`); }
+    return;
+  }
+  if (sub === 'status') {
+    const { url, token } = relayConfig();
+    if (!url) { console.log('relay: not configured — `coord.js relay deploy` sets one up on your Cloudflare account'); return; }
+    const r = (deps.request || relayRequest)('GET', '/v1/status');
+    console.log(`relay ${url} (as ${r.as}${token ? '' : ', no local token'})`);
+    for (const m of r.machines || []) console.log(`  ${m.machine}: ${m.sessions} sessions, seen ${agoLabel(m.seen, nowMs)}`);
+    return;
+  }
+  if (sub === 'token') return relayRequire('./relay-admin.js').cmdToken(args, { relayRequest, dataDir, deps });
+  if (sub === 'deploy') return relayRequire('./relay-admin.js').cmdDeploy(args, { relayRequest, dataDir, configFile, relayMachine, deps });
+  throw new Error('usage: relay <status|sync|deploy|token add <name>|token revoke <name>|token list>');
+}
+
+// Deploy/token tooling ships in the package but not in the single-file hook copy.
+function relayRequire(mod) {
+  const p = path.join(__dirname, mod);
+  if (!fs.existsSync(p)) throw new Error('run `npx aircontrol relay …` (this installed hook copy has no relay tooling)');
+  return require(p);
 }
 
 // ---------- handoff ----------
@@ -4620,6 +4978,9 @@ function main() {
   }
   try {
     const args = parseArgs(process.argv.slice(2));
+    const hookless = hooklessSession();
+    if (hookless && !args.session && ['claim', 'release', 'send'].includes(cmd)) args.session = hookless;
+    if (hookless && ['who', 'claim'].includes(cmd)) relaySyncQuiet(nowMs, 0);
     if (cmd === 'claim') cmdClaim(args, nowMs);
     else if (cmd === 'release') cmdRelease(args, nowMs);
     else if (cmd === 'send') cmdSend(args, nowMs);
@@ -4637,6 +4998,7 @@ function main() {
     else if (cmd === 'handoff') cmdHandoff(args, nowMs);
     else if (cmd === 'sync') cmdSync(args, nowMs);
     else if (cmd === 'cloud') cmdCloud(args, nowMs);
+    else if (cmd === 'relay') cmdRelay(args, nowMs);
     else if (cmd === 'worktrees') cmdWorktrees(args, nowMs);
     else if (cmd === 'disk') cmdDisk(args, nowMs);
     else if (cmd === 'browsers') cmdBrowsers(args);
@@ -4653,7 +5015,7 @@ function main() {
       require(installer).main(process.argv.slice(2));
     }
     else {
-      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|ledger|handoff|cloud|worktrees|disk|browsers|tasks|retro|log|skills|peek> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
+      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|ledger|handoff|cloud|relay|worktrees|disk|browsers|tasks|retro|log|skills|peek> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
       console.error('       coord.js skills <status|link|unlink> [--repo path|--global] [--targets agents,grok] [--dry-run] [--json] — mirror .claude/skills into the dirs other harnesses read');
       console.error('       coord.js sim <list|acquire|release> [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
       console.error('       coord.js ledger <add|list|show|take|note|block|unblock|done|drop> [--repo .|all|path] [--title "…"] [--points-at ref] [--status …] [--priority low|normal|high|urgent] [--depends-on id1,id2] [--mine] [--notes] — list omits notes; show <id> prints them');
@@ -4661,6 +5023,8 @@ function main() {
       console.error('       machine-readable: who [--assignable] --json · ledger list --json · sim list --json');
       console.error('       coord.js peek <file> [--keys] [--grep pattern] — print a config or env file with its secrets masked');
       console.error('       coord.js cloud <sync [--codex] [--claude]|track <session_…|url> [--intent "…"] [--repo name]|untrack <id>> — show Codex Cloud tasks and Claude cloud sessions in the roster; `send` reaches Claude cloud sessions');
+      console.error('       coord.js relay <deploy [--name n]|status|sync|token add|revoke|list <name>> — self-hosted two-way relay for other machines and cloud sessions');
+      console.error('       coord.js cloud <init [--codex]|join [--intent "…"]|inbox|leave> — join the relay from a cloud session (init writes the repo hooks / AGENTS.md block)');
       console.error('       coord.js sync — mirror state with configured peers (config.json machine/peers/autoSync)');
       console.error('       coord.js log [--date YYYY-MM-DD] [--days N] [--session name|id] [--repo path|.] [--json] — per-day activity history');
       process.exit(1);
@@ -4711,6 +5075,8 @@ module.exports = {
   suggestNextLedgerItem, cmdHandoff, LEDGER_STALE_MS,
   cmdCloud, codexTaskRecord, parseClaudeCloudId, renderCloudLine, maybeAutoCloudSync, sendToCloud, cloudConfig,
   CLOUD_CODEX, CLOUD_CLAUDE,
+  relayConfig, relaySync, relaySyncQuiet, relayClaim, remoteClaimants, relayRosterSessions, maybeAutoRelaySync, cmdRelay,
+  isCloudRuntime, messageSender, hooklessSession, cmdCloudJoin: cloudJoin, cmdCloudInbox: cloudInbox, cmdCloudLeave: cloudLeave,
   syncConfig, repoUrlKey, gitOriginKey, remoteDir, outboxDir, readRemoteSessions,
   readRemoteLedgerEvents, readAllLedgerEvents, importRemoteMessages, quoteForRemoteShell, cmdSync, maybeAutoSync,
   compactLedger, ledgerCounts, renderLedgerLine, ledgerRepoFilter, formatLedgerItem, cmdLedger, sameRepo,
