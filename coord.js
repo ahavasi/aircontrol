@@ -1213,7 +1213,26 @@ function commandDeployScopes(text) {
 // is an ordinary argument, so a quoted device id is kept and the UDID rule
 // above still sees its target.
 const HEREDOC_BODY = /<<-?\s*(['"]?)([A-Za-z_]\w*)\1[\s\S]*?^\s*\2\s*$/gm;
-const QUOTED_PROSE = /'[^'\n]*\s[^'\n]*'|"(?:[^"\\\n]|\\.)*\s(?:[^"\\\n]|\\.)*"/g;
+// Quotes are paired left to right, the way the shell reads them. A regex that
+// pairs them by pattern mis-pairs `sed -i '' 's/…/'`: the empty '' is skipped,
+// its closing quote opens a "string", and the real script body leaks out as
+// if it were arguments.
+function stripQuotedProse(text) {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '\\') { out += text.slice(i, i + 2); i += 2; continue; }
+    if (ch !== "'" && ch !== '"') { out += ch; i++; continue; }
+    let j = i + 1;
+    while (j < text.length && text[j] !== ch) j += ch === '"' && text[j] === '\\' ? 2 : 1;
+    if (j >= text.length) { out += text.slice(i); break; }
+    const span = text.slice(i, j + 1);
+    out += /\s/.test(span.slice(1, -1)) ? ' ' : span;
+    i = j + 1;
+  }
+  return out;
+}
 // The exception: under `sh -c` the quoted string IS the command, so keep it.
 const SHELL_DASH_C = /\b(?:ba|z|k|da)?sh\s+(?:-\w+\s+)*-c\b/;
 
@@ -1233,6 +1252,7 @@ const DUMPING_RE = /\b(?:cat|bat|nl|head|tail|less|more|xxd|strings|base64|grep|
 // A dump is only a leak if it reaches stdout. Written to a file or captured
 // into a variable, the value never enters the conversation, and CLAUDE.md
 // already tells the machine to read secrets exactly that way.
+const IN_PLACE_EDIT_RE = /\b(?:sed\s+(?:-[A-Za-z]*\s+(?:''\s+)?)*-[A-Za-z]*i\b|perl\s+(?:-\w+\s+)*-\w*i)/;
 const CAPTURED_RE = /=\s*[$`]\(|=\s*`|>\s*\S|\|\s*(?:xxd|base64|openssl|tee\b[^|]*>)/;
 // `security find-generic-password -w` prints the secret itself. The Keychain
 // is where every key on this machine lives, so this is the shortest path from
@@ -1244,6 +1264,8 @@ function secretDumps(text) {
   for (const segment of text.split(/[;\n]|&&|\|\|/)) {
     if (!segment.trim()) continue;
     if (CAPTURED_RE.test(segment)) continue;
+    // An in-place edit writes back into the file and prints nothing.
+    if (IN_PLACE_EDIT_RE.test(segment)) continue;
     if (KEYCHAIN_READ_RE.test(segment)) { out.push({ kind: 'secret-echo', key: 'keychain' }); continue; }
     const hit = segment.match(SECRET_FILE_RE);
     if (DUMPING_RE.test(segment) && hit) {
@@ -1262,7 +1284,7 @@ function secretDumps(text) {
 function commandOnly(cmd) {
   if (!cmd) return '';
   const text = cmd.replace(HEREDOC_BODY, ' ');
-  return SHELL_DASH_C.test(text) ? text : text.replace(QUOTED_PROSE, ' ');
+  return SHELL_DASH_C.test(text) ? text : stripQuotedProse(text);
 }
 
 // Shared by guard (denies) and the activity log (records). Returns every match,
@@ -4401,6 +4423,7 @@ function main() {
 module.exports = {
   renderDiskLine, diskUsage, staleDerivedData, derivedDataWorkspace, cmdDisk, DISK_DEFAULTS,
   staleSessionTmp, staleBuildRoots, staleLooseFiles, touchedSince, idleWorktrees,
+  stripQuotedProse,
   boundaryPrefix, pathsOverlap, isStale, isExpired, holdsClaims, mergeClaims, resolveIdPrefix, isSafeComponent,
   requireLiveSession,
   messageFilename, shortId, agoLabel, splitList, toolInputPaths, parseArgs, advisories,
