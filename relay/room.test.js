@@ -1,4 +1,6 @@
 'use strict';
+// Node 18 has WebCrypto but not as a global; the Worker runtime always does.
+if (!globalThis.crypto) globalThis.crypto = require('crypto').webcrypto;
 const test = require('node:test');
 const assert = require('node:assert');
 const { Room, sha256Hex, pathsOverlap, deployContends } = require('./room.js');

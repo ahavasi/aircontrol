@@ -1,4 +1,6 @@
 'use strict';
+// Node 18 has WebCrypto but not as a global; the Worker runtime always does.
+if (!globalThis.crypto) globalThis.crypto = require('crypto').webcrypto;
 // A local stand-in for the Worker: the same Room over node's http with
 // in-memory storage. Used by the test suite; handy for trying the relay without
 // deploying. Usage: ADMIN_TOKEN=… node relay/dev-server.js [port]  (prints the port)
