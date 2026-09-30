@@ -106,11 +106,12 @@ function cmdInit(args) {
   const host = url ? new URL(url).host : '<your relay host>';
   console.log(`wrote ${wrote.join(', ')} — commit ${wrote.length > 1 ? 'them' : 'it'} so cloud sessions pick ${wrote.length > 1 ? 'them' : 'it'} up.`);
   console.log('');
-  console.log('Then, in each cloud environment that runs this repo:');
+  console.log('Then, in each cloud environment that runs this repo');
+  console.log('(Claude: claude.ai/code > Settings > Manage cloud environments; Codex: chatgpt.com/codex > Environments):');
   console.log(`  1. Environment variable AIRCONTROL_RELAY_URL=${url || '<your relay url>'}`);
-  console.log('  2. A token: mint one with `npx aircontrol relay token add <env-name> --out <file>`.');
-  console.log('     Claude (Pro/Max): add it as an API credential for that host, so the session never sees it.');
-  console.log('     Otherwise, and on Codex: environment variable AIRCONTROL_RELAY_TOKEN=<token>. Use a token per environment so each can be revoked.');
+  console.log('  2. Environment variable AIRCONTROL_RELAY_TOKEN=<token>. Mint one per environment, straight to the clipboard:');
+  console.log('       npx aircontrol relay token add <env-name> | pbcopy');
+  console.log('     The variable name is fixed; <env-name> is only the label for `relay token revoke <env-name>`.');
   console.log(`  3. Network access: Claude "Custom" with ${host} added; Codex agent internet access with ${host} allowed and all HTTP methods (not GET-only).`);
 }
 
