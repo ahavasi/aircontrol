@@ -548,7 +548,8 @@ ${delivery}
   is empty. For ${guidanceName}, review and trust the installed hooks before shared-resource work.
 - **Never boot a simulator or emulator without leasing it first** — a lease is enforced,
   unlike a claim: \`node ${cliPath} sim acquire --session <your-name> --for "<what you're testing>"\`.
-  It returns a **UDID** (a name-based \`-destination\` silently runs zero tests) and prefers the
+  It returns a **UDID**: use the one from *this* acquire, never one from an earlier lease (a
+  name-based \`-destination\` silently runs zero tests). It prefers the
   device that already has that app's data installed. \`sim list\` shows who holds what.
 - **Release the device when you are done with it, not at some later cleanup** —
   \`node ${cliPath} sim release --session <your-name>\` shuts it down and hands it back in one
