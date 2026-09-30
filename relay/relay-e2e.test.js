@@ -140,3 +140,23 @@ test('cloud init writes gated repo hooks idempotently and an AGENTS.md block', (
   assert.equal(init.applyAgentsMd(md), md);
   assert.match(md, /cloud join --intent/);
 });
+
+test('prompt and heartbeat hooks trigger the throttled relay sync, not just session start', () => {
+  const now = Date.now();
+  const dir = tmp('aircontrol-auto-');
+  asMachine('mac', dir);
+  const repo = repoWithOrigin('auto');
+  C.cmdRegister({ session_id: 'auto-1', cwd: repo }, now);
+  process.env.AIRCONTROL_RELAY_AUTOSYNC = '1';
+  const marker = path.join(dir, 'relay.spawned');
+  try {
+    try { fs.unlinkSync(marker); } catch {}
+    const w = process.stdout.write;
+    process.stdout.write = () => true;
+    try { C.cmdInject({ session_id: 'auto-1', cwd: repo }, now); } finally { process.stdout.write = w; }
+    assert.ok(fs.existsSync(marker), 'inject spawns a relay sync');
+    fs.unlinkSync(marker);
+    C.cmdBeat({ session_id: 'auto-1', cwd: repo, tool_name: 'Edit', tool_input: { file_path: path.join(repo, 'a.js') } }, now);
+    assert.ok(fs.existsSync(marker), 'beat spawns a relay sync');
+  } finally { process.env.AIRCONTROL_RELAY_AUTOSYNC = '0'; }
+});

@@ -989,6 +989,9 @@ function cmdBeat(input, nowMs, harness) {
   if (!isSafeComponent(id)) return;
   const before = readSession(id);
   if (!before) { cmdRegister(input, nowMs, harness); return; }
+  // Sweep only runs at session start, so a long session would otherwise never
+  // push its claims; the spawn is throttled and detached.
+  try { maybeAutoRelaySync(nowMs); } catch {}
   const paths = toolInputPaths(input);
   // The activity diff comes from a pre-update snapshot: independent of the
   // debounce below (which may skip the session write entirely) and immune to
@@ -1495,6 +1498,7 @@ function cmdInject(input, nowMs, harness) {
   // One sync per prompt: prompts are rare, and a throttled pull here would show
   // the session a roster and inbox from before its last idle stretch.
   if (isCloudRuntime()) relaySyncQuiet(nowMs, 0);
+  else { try { maybeAutoRelaySync(nowMs); } catch {} }
   let ledgerPending = false;
   let budgetLine = '';
   const tp = payloadTranscript(input);
