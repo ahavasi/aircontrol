@@ -483,6 +483,34 @@ What crosses machines and what doesn't:
 - **Never synced**: leases and simulators — a lease means exclusive use of a physically
   local device — plus `guard.log`, the `activity/` history, affinity, and config.
 
+### Cloud sessions (opt-in)
+
+Codex Cloud tasks and Claude Code cloud sessions (claude.ai/code, `claude --cloud`) run in
+remote VMs that never load this machine's hooks, so they cannot register themselves.
+aircontrol mirrors them into two pseudo-machines, `cloud-codex` and `cloud-claude`, and
+treats them like peer sessions: visible in `who` and on a `[aircontrol] cloud:` roster line,
+display-only for guard and advisories.
+
+- **Codex Cloud** has a listing API. `coord.js cloud sync` runs `codex cloud list --json`
+  and mirrors every task that is not finished (`ready`, `failed`, `cancelled` and similar
+  drop off). If the CLI is missing or signed out, the last good mirror stays and ages out
+  after 30 minutes; the error goes to `sync.log`. Codex tasks take no inbound messages, so
+  `send` to one fails with a pointer to `codex cloud diff/apply`.
+- **Claude cloud sessions** have no scriptable listing, so you add them yourself:
+  `coord.js cloud track <session_…|cse_…|claude.ai/code URL> [--intent "…"] [--repo name]`.
+  A tracked session stays for 24 hours (re-run `track` to extend) or until
+  `cloud untrack <id>`. `send --to <name>` delivers through
+  `claude -p "<text>" --cloud <id>`, which queues the message as a follow-up in that
+  session through Anthropic's servers.
+
+Auto-refresh is off by default. Turn it on in `~/.claude/agents/config.json`:
+
+```json
+{ "cloud": { "codex": true, "claude": true } }
+```
+
+`sweep` then fires a detached `cloud sync` at most every 5 minutes.
+
 ### Session cleanup
 
 Four agent sessions routinely share this machine, so cleanup has to be session-scoped or it
@@ -591,6 +619,7 @@ makes either machine-readable.
   | context budget line, `retro` | ✓ (transcript JSONL) | ✓ (rollout JSONL, plus Codex's own `token_count`) |
   | `[codex]` tag in `who` and the roster | — | ✓ |
   | background-task reaping (`tasks`) | ✓ | — (no shell snapshots to attribute) |
+  | cloud sessions in roster (`cloud`) | ✓ tracked by hand; `send` delivers | ✓ polled from `codex cloud list`; no inbound messages |
 
   Codex exposes no session-id env var, so every Codex hook command carries
   `--harness codex`; a session registered by an older hooks.json is still recognised by the
