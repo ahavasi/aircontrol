@@ -541,10 +541,19 @@ never double up with your local hooks. At session start they install aircontrol 
 end of turn syncs again. The guard then denies edits on paths claimed anywhere in the same
 repo, matched by `origin` URL. Then configure the cloud environment:
 
+These settings live at claude.ai/code → Settings → Manage cloud environments:
+
 1. Environment variable `AIRCONTROL_RELAY_URL=<your relay URL>`.
-2. A token from `relay token add <env-name>`: as an API credential for the relay host where
-   your plan offers one (the session never sees it), otherwise as `AIRCONTROL_RELAY_TOKEN`.
+2. Environment variable `AIRCONTROL_RELAY_TOKEN=<token>`. Mint one token per environment and
+   send it straight to the clipboard, so it is never written to disk or shown:
+   `npx aircontrol relay token add <env-name> | pbcopy`. The variable name is fixed;
+   `<env-name>` is only the label you revoke it by (`relay token revoke <env-name>`).
 3. Network access **Custom**, with the relay host added.
+
+The session can read that variable, which is why each environment gets its own revocable
+token. An API credential that attaches `Authorization: Bearer <token>` to requests for the
+relay host would keep the token out of the session entirely (aircontrol sends no header of
+its own when the variable is unset), but that route is untested.
 
 An idle cloud session runs no hooks, so when you `send` to one, aircontrol also queues a
 short follow-up through `claude -p … --cloud <id>` to wake it. Its prompt hook then delivers

@@ -23,9 +23,10 @@ claimed paths and the text of messages between your sessions.
   environment so each can be revoked alone. The relay stores only SHA-256 hashes of tokens.
 - **The admin token** (`~/.claude/agents/relay-admin-token`, mode 600, and the Worker's
   `ADMIN_TOKEN` secret) can do everything a token can, and also mint and revoke tokens. Keep it on one machine.
-- **In cloud environments**, prefer a credential store that attaches the token to outbound
-  requests (Claude Code's API credentials) over a plain environment variable. Codex Cloud
-  removes secrets before the agent runs, so there the token is an environment variable the
-  agent can read. Use a dedicated token for it.
+- **In cloud environments**, the token is the `AIRCONTROL_RELAY_TOKEN` environment variable,
+  which the agent can read. Give each environment its own token so a leak is revoked alone. A
+  credential store that attaches the header to outbound requests would hide it from the agent,
+  but that route is untested. Codex Cloud removes secrets before the agent runs, so there the
+  variable is the only option.
 - **Failure mode.** If the relay is down or unreachable, aircontrol fails open: claims are
   recorded locally, and cross-machine claims simply are not enforced until it returns.
