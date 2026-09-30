@@ -3846,3 +3846,30 @@ test('disk reports an idle worktree but --prune never removes it', () => {
   assert.match(out, new RegExp(`idle worktree\\t.*\\t${wt.pushed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\t\\(b-pushed, clean and pushed`));
   assert.ok(fs.existsSync(wt.pushed));
 });
+
+const dumps = (cmd) => C.classifyCommand(cmd).filter((m) => m.kind === 'secret-dump');
+
+test('quoted prose is paired left to right, so an empty quote never exposes a sed script', () => {
+  assert.deepEqual(dumps("cd /x && sed -i '' 's/`ADMIN_TOKEN` secret) can only mint and revoke tokens./X/' SECURITY.md && git status --short"), []);
+  assert.deepEqual(dumps("grep -n 'client secret' README.md"), []);
+  assert.deepEqual(dumps("sed 's/credential store/x/' notes.md"), []);
+  assert.deepEqual(dumps(`grep "say \\"secret\\" twice" notes.md`), []);
+});
+
+test('in-place edits are not dumps, but printing the same file still is', () => {
+  assert.deepEqual(dumps("sed -i 's/a/b/' .env"), []);
+  assert.deepEqual(dumps("sed -i '' -e 's/a/b/' .env"), []);
+  assert.deepEqual(dumps("perl -pi -e 's/a/b/' .env"), []);
+  assert.equal(dumps('sed -n p .env').length, 1);
+  assert.equal(dumps('cat .env').length, 1);
+  assert.equal(dumps("cat 'secret.env'").length, 1);
+  assert.equal(dumps('jq . ~/.claude/settings.json').length, 1);
+});
+
+test('stripQuotedProse keeps whitespace-free quotes and leaves an unterminated quote alone', () => {
+  assert.equal(C.stripQuotedProse("a '' 'b c' d"), "a ''   d");
+  assert.equal(C.stripQuotedProse(`x "p \\" q" y`), 'x   y');
+  assert.equal(C.stripQuotedProse("cat 'settings.json'"), "cat 'settings.json'");
+  assert.equal(C.stripQuotedProse("echo it\\'s 'a b'"), "echo it\\'s  ");
+  assert.equal(C.stripQuotedProse("cat 'open ended"), "cat 'open ended");
+});
