@@ -148,6 +148,8 @@ the session expires.
 
 **6. One item per session** unless the user says otherwise. Chaining items is how a session ends up
 re-sending a huge transcript on every turn.
+To work many items in one go, use `ledger-drain`: it gives each item its own fresh subagent,
+so the main transcript only grows by a short summary per item.
 
 ---
 

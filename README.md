@@ -166,8 +166,8 @@ or switching Node versions). It:
    `~/.codex/AGENTS.md`, and **mirrors** the rest of `~/.claude/CLAUDE.md` into
    `~/.codex/AGENTS.md` inside a marked block (Codex has no `@import`). Edit the source
    and re-run; `--no-mirror-global` turns the mirror off and removes the block.
-6. Installs aircontrol's own skills (`skills/`: `ledger`, `ledger-next`, `next-steps`,
-   `session-cleanup`) into `~/.claude/skills/`. From a clone they are symlinked, so editing
+6. Installs aircontrol's own skills (`skills/`: `ledger`, `ledger-next`, `ledger-drain`,
+   `next-steps`, `session-cleanup`) into `~/.claude/skills/`. From a clone they are symlinked, so editing
    one in place edits the repo; from the npm package they are copied (the npx cache is
    temporary) and marked with `.aircontrol-managed`. A directory already there that
    aircontrol did not put there is replaced if identical, otherwise moved to
@@ -411,6 +411,11 @@ node ~/.claude/hooks/coord.js ledger take lg_7f2c1a --session captain-boopsnoot
 - **Each session gets one suggestion.** The once-per-session ledger notice appends the
   highest-priority open item *in this repo* with deps met and no owner — so a fresh session
   knows what to pick up without asking.
+- **Three skills work it.** `ledger-next` triages or works one item. `next-steps` ranks
+  everything outstanding and asks which to take. `ledger-drain` works through every item an
+  agent can finish alone, one fresh subagent and one PR each. It never merges or deploys, and it
+  leaves `ledger-drain:` note markers so later runs skip items already judged human-only or
+  needing design.
 - **`handoff` moves work between live sessions.** Ledger ownership transfers first (the durable
   record — a `handoff` event, not an ambiguous drop+take), then the sender's claims merge onto
   the recipient, then the recipient gets a message carrying the `--note` context. A crash
