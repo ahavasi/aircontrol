@@ -369,8 +369,9 @@ node ~/.claude/hooks/coord.js sim release --session captain-boopsnoot
   ignores the message still fails.
 - **Cleanup shuts down what it owns.** `sim release` shuts down only the caller's leased devices
   before releasing them, and quits Simulator.app only when no iOS device or lease remains active.
-  A real `SessionEnd` does the same best-effort cleanup; `/clear` only releases, because the
-  session carries on. Pass `--keep-booted` to hand a device back still running.
+  A real `SessionEnd` does the same best-effort cleanup in a detached child, so a slow
+  `simctl shutdown` cannot outlast the hook's timeout and get it cancelled; `/clear` only
+  releases, because the session carries on. Pass `--keep-booted` to hand a device back still running.
 - **A lease never outlives its holder, and neither does its device.** `sweep` clears any lease whose
   session has gone stale, and the next `sim list` or `sim acquire` shuts down the device that lease
   left booted. A live holder is always skipped, however old its lease, so this cannot stop a
