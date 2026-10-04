@@ -1882,6 +1882,59 @@ test('a real deregister shuts down owned devices; /clear only releases them', ()
   assert.deepEqual(C.readLeases(), []);
 });
 
+// SessionEnd has a hard budget (the hook's own timeout); under heavy load a synchronous
+// simctl shutdown overran it and the harness cancelled the hook part-way through.
+test('a live deregister hands device shutdown to a detached child and returns', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('sim-end-detach');
+  const now = Date.now();
+  const launches = [];
+  const deps = { live: true, kill: () => {}, myClaudePid: null, claudePid: null, procs: [], allProcs: [],
+    spawn: (...args) => { launches.push(args); return { unref() {} }; } };
+  C.cmdRegister({ session_id: 'ending-busy', cwd: repo }, now);
+  assert.ok(C.tryLease({ platform: 'ios', key: 'UDID-B', name: 'phone', sessionId: 'ending-busy' }));
+  C.cmdDeregister({ session_id: 'ending-busy', reason: 'prompt_input_exit' }, now, deps);
+  assert.equal(launches.length, 1);
+  assert.deepEqual(launches[0][1].slice(-3), ['deregister-devices', '--session', 'ending-busy']);
+  assert.equal(launches[0][2].detached, true);
+  assert.equal(C.readSession('ending-busy'), null, 'bookkeeping must not wait for the device');
+  assert.equal(C.readLeases().length, 1, 'the child owns the lease until its device is down');
+});
+
+test('a live deregister with no leases spawns nothing', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('sim-end-none');
+  const launches = [];
+  const deps = { live: true, kill: () => {}, myClaudePid: null, claudePid: null, procs: [], allProcs: [],
+    spawn: (...args) => { launches.push(args); return { unref() {} }; } };
+  C.cmdRegister({ session_id: 'ending-idle', cwd: repo }, Date.now());
+  C.cmdDeregister({ session_id: 'ending-idle', reason: 'prompt_input_exit' }, Date.now(), deps);
+  assert.equal(launches.length, 0);
+});
+
+test('the detached device child shuts down and releases the dead session\'s leases', () => {
+  freshDataDir();
+  const stopped = [];
+  const deps = { ...stubDeps([{ ...IOS_B, state: 'booted' }]), shutdownDevice: (lease) => { stopped.push(lease.key); },
+    quitSimulator: () => true };
+  assert.ok(C.tryLease({ platform: 'ios', key: 'UDID-B', name: 'phone', sessionId: 'gone-1' }));
+  assert.ok(C.tryLease({ platform: 'ios', key: 'UDID-C', name: 'other', sessionId: 'someone-else' }));
+  C.cmdDeregisterDevices({ session: 'gone-1' }, deps);
+  assert.deepEqual(stopped, ['UDID-B']);
+  assert.deepEqual(C.readLeases().map((l) => l.key), ['UDID-C']);
+});
+
+test('deregister reads the process table once for both reapers', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('one-ps');
+  let psCalls = 0;
+  const run = (cmd) => { if (cmd === 'ps') psCalls++; return ''; };
+  C.cmdRegister({ session_id: 'one-ps', cwd: repo }, Date.now());
+  C.cmdDeregister({ session_id: 'one-ps', reason: 'prompt_input_exit' }, Date.now(),
+    { live: true, kill: () => {}, run, liveClaudePids: new Set(), spawn: () => ({ unref() {} }) });
+  assert.equal(psCalls, 1);
+});
+
 // The bug this rule exists for: a 40-minute xcodebuild emits no heartbeat, the session reads as
 // stale, and the old rule handed the device to someone else mid-build.
 test('a quiet session keeps its device until the lease TTL, not the roster TTL', () => {

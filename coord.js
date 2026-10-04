@@ -1094,16 +1094,19 @@ function cmdDeregister(input, nowMs = Date.now(), deps = {}) {
   if (s && input.reason !== 'clear') scheduleCodexArchive(id, s, deps);
   if (s) logActivity({ ...sessionEndEvent(s, nowMs), reason: input.reason || null }, nowMs);
   try { bounceUndelivered(id, nowMs); } catch {}
-  // A real ending owns its leased devices until they are shut down. `/clear` carries on in
-  // the same harness process, so it keeps the historical release-only behavior and must not
-  // pull a simulator out from under the continuing session.
-  const mayOperateDevices = deps.live === true || typeof deps.shutdownDevice === 'function';
-  try {
-    if (input.reason !== 'clear' && mayOperateDevices) shutdownAndReleaseLeases(id, deps, { keepFailed: false });
-    else releaseSessionLeases(id);
-  } catch { try { releaseSessionLeases(id); } catch {} }
   try { fs.unlinkSync(sessionFile(id)); } catch {}
   if (isCloudRuntime()) relaySyncQuiet(nowMs, 0);
+  const ending = input.reason !== 'clear';
+  // A real ending owns its leased devices until they are shut down. `/clear` carries on in
+  // the same harness process, so it keeps the historical release-only behavior and must not
+  // pull a simulator out from under the continuing session. The shutdown itself runs in a
+  // detached child: SessionEnd is cancelled at the hook's timeout, and a simctl shutdown under
+  // load can take longer than that on its own.
+  try {
+    if (ending && typeof deps.shutdownDevice === 'function') shutdownAndReleaseLeases(id, deps, { keepFailed: false });
+    else if (ending && deps.live === true) { if (!scheduleDeviceShutdown(id, deps)) releaseSessionLeases(id); }
+    else releaseSessionLeases(id);
+  } catch { try { releaseSessionLeases(id); } catch {} }
   // SessionEnd also fires for /clear, where the session carries straight on — killing its
   // browsers there would pull the page out from under work still in progress. Only a real
   // ending reaps.
@@ -1112,11 +1115,31 @@ function cmdDeregister(input, nowMs = Date.now(), deps = {}) {
   // function, so `node --test` calls it for real, and an ungated reap resolves the REAL claude
   // ancestor and signals the developer's actual background shells. That is not hypothetical —
   // it killed two live shells the first time this ran.
+  // Reaping stays inline, unlike the device shutdown: ownership is resolved by walking up to
+  // this session's `claude`, and once it exits its shells reparent to launchd and match nothing.
   const mayReap = deps.live === true || typeof deps.kill === 'function';
-  if (input.reason !== 'clear' && mayReap) {
-    try { reapOwnBrowsers(deps); } catch {}
-    try { reapOwnTasks(deps); } catch {}
+  if (ending && mayReap) {
+    let procs;
+    try { procs = deps.procs || deps.allProcs || readAllProcs(deps.run || runQuiet); } catch { procs = []; }
+    try { reapOwnBrowsers({ ...deps, allProcs: deps.allProcs || procs }); } catch {}
+    try { reapOwnTasks({ ...deps, procs: deps.procs || procs }); } catch {}
   }
+}
+
+/// False only when the child could not be started, so the caller can still free the lease.
+function scheduleDeviceShutdown(id, deps = {}) {
+  if (!readLeases().some((lease) => lease.sessionId === id)) return true;
+  try {
+    const child = (deps.spawn || spawn)(process.execPath, [__filename, 'deregister-devices', '--session', id],
+      { detached: true, stdio: 'ignore' });
+    if (child && typeof child.unref === 'function') child.unref();
+    return true;
+  } catch { return false; }
+}
+
+function cmdDeregisterDevices(args, deps = {}) {
+  if (!isSafeComponent(args.session)) return;
+  shutdownAndReleaseLeases(args.session, deps, { keepFailed: false });
 }
 
 // ---------- guard (PreToolUse hook) ----------
@@ -4995,6 +5018,7 @@ function main() {
       if (args._[1] === 'start' && args.session) listener.ensureListener({ session_id: id }, { manual: true });
       console.log(JSON.stringify(listener.readState(id) || { status: 'not started' }, null, 1));
     }
+    else if (cmd === 'deregister-devices') cmdDeregisterDevices(args);
     else if (cmd === 'names') cmdNames(args);
     else if (cmd === 'doctor') cmdDoctor(args, nowMs);
     else if (cmd === 'sim') cmdSim(args, nowMs);
@@ -5053,7 +5077,7 @@ module.exports = {
   hashId, friendlyName, saltedName, pickNameSalt, nameStyle, writeNameStyle, configFile, NAME_STYLES, DEFAULT_NAME_STYLE, MAX_NAME_SALT,
   ensureDirs, sessionFile, writeSession, readSession, updateSession, readSessions, gitInfo, gitEnv,
   sessionLockFile, trySessionLock,
-  sweep, readStdinJson, readInbox, bounceUndelivered, cmdRegister, cmdBeat, cmdDeregister,
+  sweep, readStdinJson, readInbox, bounceUndelivered, cmdRegister, cmdBeat, cmdDeregister, cmdDeregisterDevices,
   expandUser, addGitDir, gitDirFromFile, discoverGitDirs, lockSnapshot, sameLock,
   parseLsofWritable, writableOpenState, gitProcessState, operationMarkers, inspectLock,
   doctorLogFile, doctorLocks, formatAge, cmdDoctor,
