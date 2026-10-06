@@ -145,9 +145,12 @@ async function submit(C, opts, session, deps = {}) {
 }
 function status(C, id) {
   const all = jobs(C);
+  const history = readJson(historyFile(C));
   const waiting = all.filter((j) => j.state === 'queued');
   const result = all.filter((j) => !id || j.id === id).map((j) => ({ ...j,
-    ...(j.state === 'running' && j.phase === 'command' ? { phase: readJson(path.join(root(C), j.id + '.phase.json'))?.phase || j.phase } : {}),
+    ...(j.state === 'running' && j.phase === 'command' ? { phase: readJson(path.join(root(C), j.id + '.phase.json'))?.phase || j.phase,
+      progress: readJson(path.join(root(C), j.id + '.progress.json')) || j.progress || null } : {}),
+    estimate: ACTIVE.has(j.state) || j.state === 'queued' ? estimate(j, history) : null,
     queuePosition: j.state === 'queued' ? waiting.findIndex((w) => w.id === j.id) + 1 : null,
     elapsedMs: j.startedAt ? (j.finishedAt || Date.now()) - j.startedAt : 0,
     slow: ACTIVE.has(j.state) && Date.now() - j.startedAt > 15 * 60 * 1000,
@@ -191,6 +194,214 @@ function commandForJob(argv, job, cfg) {
   if (job.kind === 'ios-test') result.push('-destination', 'platform=iOS Simulator,id=' + job.device.key);
   return result;
 }
+// Progress is read from xcodebuild's own output. Every pattern is anchored: simulator apps
+// log CoreData/CloudKit lines containing "error:" into the same stream, and a bare match on
+// that word reports a failure that never happened.
+function emptyProgress() {
+  return { partial: '', ui: { passed: 0, failed: 0 }, unit: { done: 0, failed: 0, total: null, result: null }, build: null, result: null, last: null, error: null };
+}
+function parseProgress(text, prev = emptyProgress()) {
+  const p = { ...prev, ui: { ...prev.ui }, unit: { ...prev.unit } };
+  const events = [];
+  const lines = (prev.partial + text).split('\n');
+  p.partial = lines.pop();
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, '');
+    let m;
+    if ((m = /^Test Case '-\[([\w.]+) (\w+)\]' (passed|failed) \(([\d.]+) seconds\)/.exec(line))) {
+      const [, cls, name, outcome, secs] = m;
+      const label = cls.split('.').pop() + '.' + name;
+      if (/UITests$/.test(cls.split('.')[0])) {
+        p.ui[outcome]++; p.last = label;
+        events.push({ type: 'test', label, outcome, secs: Number(secs) });
+      } else {
+        p.unit.done++; if (outcome === 'failed') p.unit.failed++;
+      }
+    } else if ((m = /^([✔✘]) Test run with (\d+) tests?/.exec(line))) {
+      p.unit.total = Number(m[2]); p.unit.result = m[1] === '✔' ? 'passed' : 'failed';
+      events.push({ type: 'unit', total: p.unit.total, outcome: p.unit.result });
+    } else if ((m = /^([✔✘]) Test /.exec(line))) {
+      p.unit.done++; if (m[1] === '✘') p.unit.failed++;
+    } else if ((m = /^\*\* (TEST BUILD|BUILD) (SUCCEEDED|FAILED) \*\*/.exec(line))) {
+      p.build = m[2].toLowerCase();
+      events.push({ type: 'build', outcome: p.build });
+    } else if ((m = /^\*\* TEST (EXECUTE )?(SUCCEEDED|FAILED) \*\*/.exec(line))) {
+      p.result = m[2].toLowerCase();
+    } else if (!p.error && (m = /^(\/\S+\.swift):(\d+):(?:\d+:)? error: (.*)$/.exec(line))) {
+      p.error = (path.basename(m[1]) + ':' + m[2] + ': ' + m[3].replace(/^-\[[^\]]*\] : /, '')).slice(0, 200);
+      events.push({ type: 'error', text: p.error });
+    }
+  }
+  return { progress: p, events };
+}
+function progressSummary(p) {
+  const { partial, ...rest } = p;
+  return rest;
+}
+function readNew(name, offset) {
+  let fd;
+  try {
+    fd = fs.openSync(name, 'r');
+    const size = fs.fstatSync(fd).size;
+    if (size <= offset) return { text: '', offset };
+    const buf = Buffer.alloc(size - offset);
+    fs.readSync(fd, buf, 0, buf.length, offset);
+    return { text: buf.toString('utf8'), offset: size };
+  } catch { return { text: '', offset }; } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+// Runners such as a project verify script send xcodebuild output to their own files and name
+// the current one in the phase file (`{ phase, log }`), so every log seen is followed, each with
+// its own offset and partial line.
+function progressReader(primary, phaseFile, fromEnd) {
+  const sources = new Map();
+  const add = (name) => {
+    if (!name || sources.has(name)) return;
+    let offset = 0;
+    if (fromEnd) try { offset = fs.statSync(name).size; } catch {}
+    sources.set(name, { offset, partial: '' });
+  };
+  add(primary);
+  let state = emptyProgress();
+  return {
+    read() {
+      const named = readJson(phaseFile)?.log;
+      if (typeof named === 'string' && path.isAbsolute(named)) add(named);
+      const events = [];
+      for (const [name, src] of sources) {
+        const chunk = readNew(name, src.offset);
+        if (!chunk.text) continue;
+        src.offset = chunk.offset;
+        const parsed = parseProgress(chunk.text, { ...state, partial: src.partial });
+        src.partial = parsed.progress.partial;
+        state = { ...parsed.progress, partial: '' };
+        events.push(...parsed.events);
+      }
+      return { progress: state, events };
+    },
+  };
+}
+function trackProgress(logPath, out, phaseFile, intervalMs = 3000) {
+  const reader = progressReader(logPath, phaseFile, true);
+  let state = emptyProgress();
+  const tick = () => {
+    const { progress, events } = reader.read();
+    state = progress;
+    if (events.length || progress.ui.passed || progress.unit.done) try { atomic(out, progressSummary(state)); } catch {}
+  };
+  const timer = setInterval(tick, intervalMs);
+  timer.unref?.();
+  return { stop() { clearInterval(timer); tick(); return progressSummary(state); } };
+}
+
+// Durations are keyed on what the command does, not where it writes: derived data, result
+// bundles, destinations and signing keys differ between worktrees running the same suite.
+const VOLATILE = new Set(['-derivedDataPath', '-destination', '-resultBundlePath', '-authenticationKeyPath', '-authenticationKeyID', '-authenticationKeyIssuerID']);
+function fingerprint(job) {
+  const argv = [];
+  for (let i = 0; i < (job.command || []).length; i++) {
+    if (VOLATILE.has(job.command[i])) { i++; continue; }
+    argv.push(job.command[i]);
+  }
+  return crypto.createHash('sha1').update([job.kind, job.repo || path.basename(job.cwd || ''), ...argv].join('\0')).digest('hex').slice(0, 16);
+}
+const historyFile = (C) => path.join(root(C), 'history.json');
+function recordHistory(C, job) {
+  if (!Number.isFinite(job.timings?.commandMs)) return;
+  const all = readJson(historyFile(C)) || {};
+  const key = fingerprint(job);
+  const ui = job.progress ? job.progress.ui.passed + job.progress.ui.failed : null;
+  all[key] = [...(all[key] || []), { commandMs: job.timings.commandMs, ui, unit: job.progress?.unit.total ?? null, at: Date.now() }].slice(-5);
+  atomic(historyFile(C), all);
+}
+function estimate(job, history) {
+  const runs = (history || {})[fingerprint(job)] || [];
+  if (!runs.length) return null;
+  const sorted = runs.map((r) => r.commandMs).sort((a, b) => a - b);
+  const last = runs[runs.length - 1];
+  return { commandMs: sorted[Math.floor(sorted.length / 2)], ui: last.ui, unit: last.unit };
+}
+function remainingMs(j, now = Date.now()) {
+  if (!j.estimate) return null;
+  if (j.state === 'queued') return j.estimate.commandMs;
+  if (!j.commandStartedAt) return j.estimate.commandMs;
+  return j.estimate.commandMs - (now - j.commandStartedAt);
+}
+function formatDuration(ms) {
+  const m = Math.round(ms / 60000);
+  return m < 1 ? '<1m' : m + 'm';
+}
+function formatProgress(j, now = Date.now()) {
+  const parts = [];
+  const p = j.progress;
+  if (p) {
+    const ui = p.ui.passed + p.ui.failed;
+    if (ui || j.estimate?.ui) parts.push(`${ui}${j.estimate?.ui ? '/' + j.estimate.ui : ''} UI${p.ui.failed ? ` (${p.ui.failed} failed)` : ''}`);
+    if (p.unit.total) parts.push(`${p.unit.total} unit ${p.unit.result === 'passed' ? '✓' : '✗'}`);
+    else if (p.unit.done) parts.push(`${p.unit.done}${j.estimate?.unit ? '/' + j.estimate.unit : ''} unit`);
+    if (!ui && !p.unit.done && !p.unit.total && p.build) parts.push(`build ${p.build}`);
+  }
+  if (ACTIVE.has(j.state) || j.state === 'queued') {
+    const left = remainingMs(j, now);
+    if (left !== null) parts.push(left > 0 ? `~${formatDuration(left)} left` : 'running over estimate');
+  }
+  return parts.join(' · ');
+}
+const PHASES = { starting: 'starting', boot: 'booting simulator', build: 'building', command: 'running', test: 'testing', cleanup: 'cleaning up' };
+const phaseLabel = (phase) => PHASES[phase] || phase;
+function formatClock(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+function renderEvent(e) {
+  if (e.type === 'test') return `${e.outcome === 'passed' ? '✅' : '❌'} ${e.label} (${e.secs.toFixed(1)}s)`;
+  if (e.type === 'unit') return `${e.outcome === 'passed' ? '✅' : '❌'} unit tests: ${e.total} ${e.outcome}`;
+  if (e.type === 'build') return `🔨 build ${e.outcome}`;
+  if (e.type === 'error') return `   ↳ ${e.text}`;
+  return null;
+}
+// Replays the log from the start, so attaching late still shows every finished test.
+async function watch(C, id, opts = {}) {
+  const write = opts.write || ((line) => console.log(line));
+  const interval = opts.intervalMs ?? 2000;
+  let last = null;
+  const reader = progressReader(status(C, id).log, path.join(root(C), id + '.phase.json'), false);
+  let state = emptyProgress();
+  for (;;) {
+    const j = status(C, id);
+    const where = j.state === 'queued' ? `queued #${j.queuePosition}` : phaseLabel(j.phase || j.state);
+    if (where !== last && !TERMINAL.has(j.state)) {
+      const progress = formatProgress(j);
+      write(`⏱ ${formatClock(j.elapsedMs)} ${where}${progress ? ' · ' + progress : ''}`);
+      last = where;
+    }
+    const parsed = reader.read();
+    state = parsed.progress;
+    if (!opts.quiet) for (const e of parsed.events) { const line = renderEvent(e); if (line) write(line); }
+    if (TERMINAL.has(j.state)) {
+      const progress = formatProgress({ ...j, progress: j.progress || progressSummary(state) });
+      write(`done: ${j.state} in ${formatClock(j.elapsedMs)}${progress ? ' · ' + progress : ''}${j.error ? ' · ' + j.error : ''}`);
+      return j.state === 'succeeded' ? 0 : 1;
+    }
+    await delay(interval);
+  }
+}
+function renderTestsLine(all, selfId, now = Date.now()) {
+  const active = all.filter((j) => ACTIVE.has(j.state));
+  const queued = all.filter((j) => j.state === 'queued');
+  if (!active.length && !queued.length) return '';
+  const mine = (j) => j.owner === selfId;
+  const shown = [...active, ...queued.filter(mine)].sort((a, b) => Number(mine(b)) - Number(mine(a)) || a.sequence - b.sequence).slice(0, 3);
+  const items = shown.map((j) => {
+    const who = mine(j) ? 'you' : j.ownerName;
+    const where = j.state === 'queued' ? `queued #${j.queuePosition}` : phaseLabel(j.phase || j.state);
+    const progress = formatProgress(j, now);
+    return `${j.id.slice(0, 9)}… (${who}) ${where}${progress ? ' · ' + progress : ''}`;
+  });
+  const others = queued.filter((j) => !mine(j)).length;
+  if (others) items.push(`${others} other job${others === 1 ? '' : 's'} queued`);
+  return `[aircontrol] tests: ${items.join(' | ')} — \`coord.js test watch <id>\` to follow`;
+}
+
 async function execute(argv, job, env, logFd) {
   await new Promise((resolve, reject) => {
     const child = spawn(argv[0], argv.slice(1), { cwd: job.cwd, env, stdio: ['ignore', logFd, logFd] });
@@ -211,6 +422,7 @@ async function work(C, id) {
   job.phase = job.kind === 'ios-test' ? 'boot' : 'build';
   atomic(file(C, id), job);
   const logFd = fs.openSync(job.log, 'a', 0o600);
+  let tracker = null;
   const env = { ...process.env, AIRCONTROL_TEST_JOB_ID: id, AIRCONTROL_TEST_JOBS: String(config(C).jobs), AIRCONTROL_SIM_UDID: job.device?.key || '',
     AIRCONTROL_TEST_METRICS_PATH: path.join(root(C), id + '.metrics.json'), AIRCONTROL_TEST_PHASE_PATH: path.join(root(C), id + '.phase.json') };
   try {
@@ -220,14 +432,20 @@ async function work(C, id) {
       await execute(['xcrun', 'simctl', 'bootstatus', job.device.key, '-b'], job, env, logFd);
       job.timings.bootMs = Date.now() - begin;
     }
-    job.phase = 'command'; atomic(file(C, id), job);
     const begin = Date.now();
+    job.phase = 'command'; job.commandStartedAt = begin; atomic(file(C, id), job);
+    tracker = trackProgress(job.log, path.join(root(C), id + '.progress.json'), env.AIRCONTROL_TEST_PHASE_PATH);
     await execute(commandForJob(job.command, job, config(C)), job, env, logFd);
     job.timings.commandMs = Date.now() - begin;
     job.result = 'succeeded';
   } catch (e) { job.result = 'failed'; job.error = e.message; }
   finally {
     fs.closeSync(logFd);
+    if (tracker) {
+      job.progress = tracker.stop();
+      try { fs.unlinkSync(path.join(root(C), id + '.progress.json')); } catch {}
+    }
+    if (job.result === 'succeeded') try { recordHistory(C, job); } catch {}
     const metrics = readJson(env.AIRCONTROL_TEST_METRICS_PATH);
     if (metrics) {
       for (const phase of ['buildMs', 'testMs']) if (Number.isFinite(metrics[phase])) job.timings[phase] = metrics[phase];
@@ -347,17 +565,23 @@ async function cli(C, argv) {
     const id = args._[2];
     if (id) file(C, id);
     result = status(C, id); ensureRunner(C);
+  } else if (sub === 'watch') {
+    const id = args._[2];
+    if (!id) throw new Error('usage: test watch <job-id> [--quiet]');
+    file(C, id); ensureRunner(C);
+    process.exitCode = await watch(C, id, { quiet: Boolean(args.quiet) });
+    return;
   } else {
     const session = C.requireLiveSession(args, Date.now());
     if (sub === 'submit') result = await submit(C, { kind: args.kind, cwd: args.cwd, name: args.name,
       runtime: args.runtime, bundleId: args['bundle-id'], command: separator < 0 ? [] : argv.slice(separator + 1) }, session);
     else if (sub === 'cancel') result = await cancel(C, args._[2], session.sessionId);
-    else throw new Error('usage: test submit|status|cancel');
+    else throw new Error('usage: test submit|status|watch|cancel');
   }
   if (args.json) console.log(JSON.stringify(result));
-  else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
+  else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
 }
-module.exports = { DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);

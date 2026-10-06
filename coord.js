@@ -364,13 +364,13 @@ function renderMessageLines(messages, nowMs) {
   return lines;
 }
 
-function renderInjection(self, others, messages, nowMs, cliPath = '~/.claude/hooks/coord.js', ledgerLine = '', budgetLine = '', diskLine = '') {
+function renderInjection(self, others, messages, nowMs, cliPath = '~/.claude/hooks/coord.js', ledgerLine = '', budgetLine = '', diskLine = '', testsLine = '') {
   const live = others.filter((o) => !isExpired(o, nowMs));
   if (live.length === 0 && messages.length === 0) {
     const solo = `[aircontrol] session ${friendlyName(self.sessionId)} — no other sessions active on this machine.`;
     // The solo path is the common case, and the case the retro data came from. The budget
     // line has to survive this early return or it never fires where it matters most.
-    return [solo, ledgerLine, budgetLine, diskLine].filter(Boolean).join('\n');
+    return [solo, testsLine, ledgerLine, budgetLine, diskLine].filter(Boolean).join('\n');
   }
   const lines = [`[aircontrol] You are session ${friendlyName(self.sessionId)}.`];
   const same = live.filter((o) => o.repo === self.repo);
@@ -393,6 +393,7 @@ function renderInjection(self, others, messages, nowMs, cliPath = '~/.claude/hoo
     lines.push('⚠️ Advisories:');
     for (const a of adv) lines.push(`- ${a}`);
   }
+  if (testsLine) lines.push(testsLine);
   if (ledgerLine) lines.push(ledgerLine);
   if (budgetLine) lines.push(budgetLine);
   if (diskLine) lines.push(diskLine);
@@ -1591,7 +1592,12 @@ function cmdInject(input, nowMs, harness) {
   try { diskLine = renderDiskLine(diskUsage(s.worktree || os.homedir()), cliPath); } catch { diskLine = ''; }
   let cloudLine = '';
   try { cloudLine = renderCloudLine(nowMs); } catch { cloudLine = ''; }
-  const context = [renderInjection(s, others, inbox, nowMs, cliPath, ledgerLine, budgetLine, diskLine), cloudLine].filter(Boolean).join('\n');
+  let testsLine = '';
+  try {
+    const Q = require('./test-queue.js');
+    if (Q.config(module.exports).enabled) testsLine = Q.renderTestsLine(Q.status(module.exports), id, nowMs);
+  } catch { testsLine = ''; }
+  const context = [renderInjection(s, others, inbox, nowMs, cliPath, ledgerLine, budgetLine, diskLine, testsLine), cloudLine].filter(Boolean).join('\n');
   // Both harnesses take the same shape, and it is the quiet one. `additionalContext`
   // reaches the model without echoing the roster into the operator's terminal; bare stdout
   // is *printed as well as* injected, which put a block of coordination state in front of

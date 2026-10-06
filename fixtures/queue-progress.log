@@ -1,0 +1,36 @@
+CoreData: error: <NSPersistentStoreCoordinator: 0x1055b9680>: Attempting recovery from error encountered during addPersistentStore: 0x10547d6e0 Error Domain=NSCocoaErrorDomain Code=512 "The file couldn’t be saved." UserInfo={reason=Failed to create file; code = 2}
+2026-10-06 12:54:32.732379-0400 CardOps[57460:5033260] [error] CoreData: error: During recovery, parent directory path reported as missing
+CoreData: error: During recovery, parent directory path reported as missing
+2026-10-06 12:54:32.740246-0400 CardOps[57460:5033260] [error] CoreData: error: Recovery attempt while adding <NSPersistentStoreDescription: 0x10547d6e0> (type: SQLite, url: file:///Users/andrehavasi/Library/Developer/CoreSimulator/Devices/F2CA0B6F-7645-4991-BF4E-EF669B55055D/data/Containers/Shared/AppGroup/D0897774-10DE-4B44-B646-1E7801FC7C51/Library/Application%20Support/inventory.store) was suc
+CoreData: error: Recovery attempt while adding <NSPersistentStoreDescription: 0x10547d6e0> (type: SQLite, url: file:///Users/andrehavasi/Library/Developer/CoreSimulator/Devices/F2CA0B6F-7645-4991-BF4E-EF669B55055D/data/Containers/Shared/AppGroup/D0897774-10DE-4B44-B646-1E7801FC7C51/Library/Application%20Support/inventory.store) was successful!
+2026-10-06 12:54:32.780338-0400 CardOps[57460:5034027] [CK] Could not validate account info cache. (This is a potential performance issue.)
+2026-10-06 12:54:32.791312-0400 CardOps[57460:5034035] [CloudKit] CoreData+CloudKit: -[NSCloudKitMirroringDelegate _performSetupRequest:]_block_invoke(1230): <NSCloudKitMirroringDelegate: 0x105700620>: Failed to set up CloudKit integration for store: <NSSQLCore: 0x10569c780> (URL: file:///Users/andrehavasi/Library/Developer/CoreSimulator/Devices/F2CA0B6F-7645-4991-BF4E-EF669B55055D/data/Containers
+Error Domain=NSCocoaErrorDomain Code=134400 "Unable to initialize without an iCloud account (CKAccountStatusNoAccount)." UserInfo={NSLocalizedFailureReason=Unable to initialize without an iCloud account (CKAccountStatusNoAccount).}
+2026-10-06 12:54:32.791434-0400 CardOps[57460:5034035] [CloudKit] CoreData+CloudKit: -[NSCloudKitMirroringDelegate recoverFromError:](2304): <NSCloudKitMirroringDelegate: 0x105700620> - Attempting recovery from error: Error Domain=NSCocoaErrorDomain Code=134400 "Unable to initialize without an iCloud account (CKAccountStatusNoAccount)." UserInfo={NSLocalizedFailureReason=Unable to initialize witho
+2026-10-06 12:54:32.791516-0400 CardOps[57460:5034035] [CloudKit] CoreData+CloudKit: -[NSCloudKitMirroringDelegate _recoverFromError:withZoneIDs:forStore:inMonitor:](2617): <NSCloudKitMirroringDelegate: 0x105700620> - Failed to recover from error: NSCocoaErrorDomain:134400
+◇ Test unavailableAndIneligibleNeverProduceBadge() started.
+✔ Test unavailableAndIneligibleNeverProduceBadge() passed after 0.001 seconds.
+✔ Test run with 1183 tests in 159 suites passed after 14.068 seconds.
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testBatchControlsAndDraftShortcut]' started.
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testBatchControlsAndDraftShortcut]' passed (32.672 seconds).
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testBatchReceiptShowsLatestCardAndRunningCount]' started.
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testBatchReceiptShowsLatestCardAndRunningCount]' passed (24.935 seconds).
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testBatchScanIsAvailableFromAddCardScanner]' started.
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testBatchScanIsAvailableFromAddCardScanner]' passed (21.015 seconds).
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testBatchScanIsHiddenInPriceMode]' started.
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testBatchScanIsHiddenInPriceMode]' passed (22.223 seconds).
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testCameraUnavailableOffersRetryAndManualSearch]' started.
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testCameraUnavailableOffersRetryAndManualSearch]' passed (12.637 seconds).
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testClearAllDraftsRequiresExplicitConfirmation]' started.
+Test Case '-[CardOpsUITests.BatchScanDraftFlowUITests testClearAllDraftsRequiresExplicitConfirmation]' failed (16.087 seconds).
+Test Case '-[CardOpsUITests.DealScannerUITests testDuplicateCardsKeepIndependentAskingPrices]' started.
+Test Case '-[CardOpsUITests.DealScannerUITests testDuplicateCardsKeepIndependentAskingPrices]' passed (37.908 seconds).
+Test Case '-[CardOpsUITests.DealScannerUITests testFreeUserSeesProGate]' started.
+Test Case '-[CardOpsUITests.DealScannerUITests testFreeUserSeesProGate]' passed (17.195 seconds).
+Test Case '-[CardOpsUITests.ScanModePickerUITests testLatchedMatchSurvivesModeSwitch]' started.
+Test Case '-[CardOpsUITests.ScanModePickerUITests testLatchedMatchSurvivesModeSwitch]' passed (22.230 seconds).
+Test Case '-[CardOpsUITests.ShowScanAskingPriceUITests testAskingPriceScoresAndPrefillsBuy]' started.
+Test Case '-[CardOpsUITests.ShowScanAskingPriceUITests testAskingPriceScoresAndPrefillsBuy]' passed (26.090 seconds).
+Test Suite 'BatchScanDraftFlowUITests' failed at 2026-10-06 12:57:01.790.
+/Users/andrehavasi/Documents/Projects/Swift/pokemon-tracker-batch-polish/CardOpsUITests/BatchScanDraftFlowUITests.swift:214: error: -[CardOpsUITests.BatchScanDraftFlowUITests testClearAllDraftsRequiresExplicitConfirmation] : XCTAssertTrue failed
+** TEST FAILED **

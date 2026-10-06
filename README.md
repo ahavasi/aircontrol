@@ -382,6 +382,7 @@ The opt-in host-local queue is shared by Claude Code and Codex through the same 
 node ~/.codex/hooks/coord.js test configure --enabled true --devices Aircontrol-Agent --runtime "iOS 26.5" --max-xcode 1 --max-simulators 1 --jobs 4
 node ~/.codex/hooks/coord.js test submit --session <name> --kind ios-test -- xcodebuild -project App.xcodeproj -scheme App test
 node ~/.codex/hooks/coord.js test status <job-id> --json
+node ~/.codex/hooks/coord.js test watch <job-id>            # live: phase, each test ✅/❌, first error, ETA
 node ~/.codex/hooks/coord.js test cancel <job-id> --session <name>
 ```
 
@@ -390,6 +391,8 @@ Submission returns immediately; FIFO jobs acquire their device when admitted. Ra
 Only Xcode or `testing.runnerScripts` (relative to the submitted worktree, default `scripts/verify.mjs`) can run through the queue. Trusted Node runners consume `AIRCONTROL_SIM_UDID`, `AIRCONTROL_TEST_JOBS`, and `AIRCONTROL_TEST_JOB_ID`; they must enforce those settings for every subprocess. Queue scripts are not a security boundary against intentionally modified project code. Source build/test caching belongs to the project runner.
 
 The dispatcher and job supervisors are detached, short-lived processes, not a permanent service. Queue locks use unique per-contender files and process identities. Cancellation targets only the job process group. If a supervisor dies, its remaining descendants retain capacity; cleanup retries after they exit. A failed simulator shutdown retains both capacity and lease. Status reports phase, elapsed time, queue position, owner, device and log. Jobs older than 15 minutes are marked slow without being killed. Project runners may write `AIRCONTROL_TEST_METRICS_PATH` with build/test timing details.
+
+While a job runs, the supervisor folds new log output into progress counts (UI tests passed/failed, Swift Testing totals, build result, first `file.swift:N: error:`). Only anchored xcodebuild lines count, so app log noise such as CoreData `error:` lines never reads as a failure. Successful runs record their duration under a fingerprint of the command (kind, repo, argv minus derived-data, destination, result-bundle and signing-key paths), and the median of the last five gives queued and running jobs an ETA. Every `[aircontrol]` prompt block carries a `tests:` line for active jobs, your own first, and `test watch` replays the log from the start, so attaching late still lists every finished test; it exits 0 or 1 with the job.
 
 Disable admission with `test configure --enabled false` during rollback; existing jobs still finish cleanup. Reinstall from the source checkout to update both harnesses. No remote scheduling or cross-worktree artifact sharing is involved.
 

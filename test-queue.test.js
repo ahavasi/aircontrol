@@ -203,3 +203,74 @@ test('cleanup phase overrides a runner phase marker', async () => {
   Q.atomic(path.join(Q.root(C), job.id + '.phase.json'), { phase: 'test' });
   assert.equal(Q.status(C, job.id).phase, 'cleanup');
 });
+
+const fixture = fs.readFileSync(path.join(__dirname, 'fixtures', 'queue-progress.log'), 'utf8');
+test('progress parser counts UI and unit results from a real job log and ignores CoreData noise', () => {
+  const { progress, events } = Q.parseProgress(fixture);
+  assert.deepEqual(progress.ui, { passed: 9, failed: 1 });
+  assert.equal(progress.unit.total, 1183);
+  assert.equal(progress.unit.result, 'passed');
+  assert.equal(progress.result, 'failed');
+  assert.equal(progress.error, 'BatchScanDraftFlowUITests.swift:214: XCTAssertTrue failed');
+  assert.equal(events.filter((e) => e.type === 'error').length, 1, 'CoreData "error:" lines are not failures');
+  assert.deepEqual(events.find((e) => e.type === 'test'), { type: 'test', label: 'BatchScanDraftFlowUITests.testBatchControlsAndDraftShortcut', outcome: 'passed', secs: 32.672 });
+});
+test('progress parser carries a line split across reads', () => {
+  const cut = fixture.indexOf("Test Case '-[CardOpsUITests") + 20;
+  const first = Q.parseProgress(fixture.slice(0, cut));
+  const second = Q.parseProgress(fixture.slice(cut), first.progress);
+  assert.deepEqual(second.progress.ui, Q.parseProgress(fixture).progress.ui);
+});
+test('fingerprint ignores per-worktree paths and estimate takes the median run', () => {
+  const session = setup();
+  const base = { kind: 'ios-test', repo: 'repo', cwd: '/a', command: ['xcodebuild', '-scheme', 'App', '-derivedDataPath', '/a/DD', 'test'] };
+  assert.equal(Q.fingerprint(base), Q.fingerprint({ ...base, cwd: '/b', command: ['xcodebuild', '-scheme', 'App', '-derivedDataPath', '/b/DD', 'test'] }));
+  assert.notEqual(Q.fingerprint(base), Q.fingerprint({ ...base, command: ['xcodebuild', '-scheme', 'Other', 'test'] }));
+  assert.equal(Q.estimate(base, null), null);
+  for (const ms of [300000, 900000, 600000]) Q.recordHistory(C, { ...base, timings: { commandMs: ms }, progress: { ui: { passed: 5, failed: 1 }, unit: { total: 1183 } } });
+  const history = JSON.parse(fs.readFileSync(path.join(Q.root(C), 'history.json'), 'utf8'));
+  assert.deepEqual(Q.estimate(base, history), { commandMs: 600000, ui: 6, unit: 1183 });
+  void session;
+});
+test('tests line shows own jobs first with progress and ETA, and is empty when idle', () => {
+  const now = 1_000_000;
+  const job = (o) => ({ id: 'test_0123456789abcdef', sequence: 1, owner: 'me', ownerName: 'me', state: 'running', phase: 'command', ...o });
+  assert.equal(Q.renderTestsLine([job({ state: 'succeeded' })], 'me', now), '');
+  const line = Q.renderTestsLine([
+    job({ id: 'test_aaaaaaaaaaaaaaaa', owner: 'peer', ownerName: 'peer-name', sequence: 1 }),
+    job({ commandStartedAt: now - 120000, estimate: { commandMs: 300000, ui: 6, unit: null }, progress: { ui: { passed: 4, failed: 0 }, unit: { done: 0, failed: 0, total: 1183, result: 'passed' } }, sequence: 2 }),
+    job({ id: 'test_bbbbbbbbbbbbbbbb', owner: 'peer', state: 'queued', queuePosition: 1, sequence: 3 }),
+  ], 'me', now);
+  assert.match(line, /^\[aircontrol\] tests: test_0123… \(you\) running · 4\/6 UI · 1183 unit ✓ · ~3m left \| test_aaaa… \(peer-name\) running \| 1 other job queued/);
+});
+test('watch replays a finished job and exits with its result', async () => {
+  setup();
+  const id = 'test_cccccccccccccccc';
+  const log = path.join(Q.root(C), id + '.log');
+  fs.mkdirSync(Q.root(C), { recursive: true });
+  fs.writeFileSync(log, fixture);
+  Q.atomic(Q.file(C, id), { id, sequence: 1, state: 'failed', phase: 'cleanup', kind: 'ios-test', command: ['x'], cwd: __dirname, owner: 'o', ownerName: 'o', log, startedAt: 1000, finishedAt: 126000, error: 'command exited 65' });
+  const out = [];
+  const code = await Q.watch(C, id, { write: (l) => out.push(l), intervalMs: 1 });
+  assert.equal(code, 1);
+  assert.ok(out.includes('✅ BatchScanDraftFlowUITests.testBatchControlsAndDraftShortcut (32.7s)'));
+  assert.ok(out.includes('❌ BatchScanDraftFlowUITests.testClearAllDraftsRequiresExplicitConfirmation (16.1s)'));
+  assert.ok(out.includes('✅ unit tests: 1183 passed'));
+  assert.match(out[out.length - 1], /^done: failed in 2:05 · 10 UI \(1 failed\) · 1183 unit ✓ · command exited 65$/);
+});
+
+test('watch follows the log a runner names in its phase file', async () => {
+  setup();
+  const id = 'test_dddddddddddddddd';
+  fs.mkdirSync(Q.root(C), { recursive: true });
+  const log = path.join(Q.root(C), id + '.log');
+  const side = path.join(Q.root(C), id + '-test.log');
+  fs.writeFileSync(log, 'test: ' + path.basename(side) + '\n');
+  fs.writeFileSync(side, fixture);
+  Q.atomic(path.join(Q.root(C), id + '.phase.json'), { phase: 'test', log: side });
+  Q.atomic(Q.file(C, id), { id, sequence: 1, state: 'succeeded', phase: 'cleanup', kind: 'ios-test', command: ['x'], cwd: __dirname, owner: 'o', ownerName: 'o', log, startedAt: 1000, finishedAt: 61000 });
+  const out = [];
+  assert.equal(await Q.watch(C, id, { write: (l) => out.push(l), intervalMs: 1 }), 0);
+  assert.ok(out.includes('✅ unit tests: 1183 passed'));
+  assert.match(out[out.length - 1], /^done: succeeded in 1:00 · 10 UI \(1 failed\) · 1183 unit ✓$/);
+});
