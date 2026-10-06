@@ -274,3 +274,9 @@ test('watch follows the log a runner names in its phase file', async () => {
   assert.ok(out.includes('✅ unit tests: 1183 passed'));
   assert.match(out[out.length - 1], /^done: succeeded in 1:00 · 10 UI \(1 failed\) · 1183 unit ✓$/);
 });
+
+test('no ETA once the command has finished and the job is cleaning up', () => {
+  const j = { id: 'test_0123456789abcdef', sequence: 1, owner: 'me', ownerName: 'me', state: 'cleaning', phase: 'cleanup', commandStartedAt: 0,
+    timings: { commandMs: 160000 }, estimate: { commandMs: 160000, ui: 0, unit: 1185 }, progress: { ui: { passed: 0, failed: 0 }, unit: { done: 0, failed: 0, total: 1185, result: 'passed' } } };
+  assert.equal(Q.formatProgress(j, 200000), '1185 unit ✓');
+});

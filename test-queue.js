@@ -321,7 +321,8 @@ function estimate(job, history) {
   return { commandMs: sorted[Math.floor(sorted.length / 2)], ui: last.ui, unit: last.unit };
 }
 function remainingMs(j, now = Date.now()) {
-  if (!j.estimate) return null;
+  // Once the command has finished, the run has already been recorded into its own estimate.
+  if (!j.estimate || Number.isFinite(j.timings?.commandMs) || j.phase === 'cleanup') return null;
   if (j.state === 'queued') return j.estimate.commandMs;
   if (!j.commandStartedAt) return j.estimate.commandMs;
   return j.estimate.commandMs - (now - j.commandStartedAt);
