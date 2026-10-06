@@ -27,6 +27,7 @@
   },
   "files": [
     "coord.js",
+    "test-queue.js",
     "codex-listener.js",
     "cmux-codex-remote.sh",
     "install.js",

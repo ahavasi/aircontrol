@@ -9,7 +9,7 @@ npm test               # node --test; every test sandboxes HOME via AIRCONTROL_H
 node install.js        # install your working copy into ~/.claude and ~/.codex
 ```
 
-- `coord.js` is the whole runtime: hooks, CLI, guard. `install.js` wires it into both
+- `coord.js` implements hooks, CLI and guards; `test-queue.js` supervises queued jobs. `install.js` wires them into both
   harnesses. The installed copies under `~/.claude/hooks` and `~/.codex/hooks` are
   overwritten on every install, so change the repo and re-run `node install.js`.
 - Installing from a clone symlinks `skills/` into `~/.claude/skills`, so skill edits land

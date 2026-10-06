@@ -1187,9 +1187,17 @@ const MAX_BLOCKED = 20;
 const GIT_PUSH_RE = /\bgit\b[^\n;|&]*?\bpush\b/;
 
 function commandText(input) {
-  const c = input && input.tool_input && input.tool_input.command;
+  const c = input && input.tool_input && (input.tool_input.command || input.tool_input.cmd);
   if (typeof c === 'string') return c;
   if (Array.isArray(c) && c.every((x) => typeof x === 'string')) return c.join(' ');
+  const code = input && input.tool_input && input.tool_input.code;
+  if (typeof code === 'string') {
+    const commands = [];
+    for (const match of code.matchAll(/\b(?:cmd|command)\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g)) {
+      try { commands.push(match[1][0] === '"' ? JSON.parse(match[1]) : match[1].slice(1, -1).replace(/\\'/g, "'")); } catch {}
+    }
+    return commands.join('\n');
+  }
   return '';
 }
 
@@ -1339,8 +1347,20 @@ function classifyCommand(cmd) {
   const text = commandOnly(cmd);
   if (!text.trim()) return [];
   const out = [];
+  const queued = /\b(?:coord\.js|aircontrol)["']?\s+test\s+submit\b[^;\n&|]*\s--\s[^;\n&|]*/g;
+  const direct = text.replace(queued, '');
+  if (direct.split(/[;\n]|&&|\|\|/).some((part) => /\bxcodebuild\b/.test(part) && !/(?:^|\s)-(?:help|version|list|showsdks|showBuildSettings|showdestinations)(?:\s|$)/.test(part))) out.push({ kind: 'xcode-job' });
   const sim = text.match(SIMCTL_BOOT_RE);
   if (sim) out.push({ kind: 'sim-boot', key: sim[1] });
+  if (require('./test-queue.js').config(module.exports).enabled) {
+    for (const match of text.matchAll(/\bsimctl\s+(boot|bootstatus|erase|shutdown|delete|uninstall)\s+([A-Za-z0-9_.-]+)/g)) {
+      if (!sim || !['boot', 'bootstatus'].includes(match[1])) out.push({ kind: 'sim-control', action: match[1], key: match[2] });
+    }
+    for (const part of cmd.replace(HEREDOC_BODY, ' ').split(/[;\n]|&&|\|\|/)) {
+      const match = part.match(/^\s*(?:xcrun\s+)?simctl\s+(boot|bootstatus|erase|shutdown|delete|uninstall)\s+("[^"]+"|'[^']+'|[A-Za-z0-9_.-]+)/);
+      if (match) out.push({ kind: 'sim-control', action: match[1], key: match[2].replace(/^["']|["']$/g, '') });
+    }
+  }
   const avd = text.match(EMULATOR_AVD_RE);
   if (avd) out.push({ kind: 'avd-boot', key: avd[1] });
   const stash = text.match(GIT_STASH_RE);
@@ -1354,7 +1374,10 @@ function classifyCommand(cmd) {
 }
 
 function guardLeaseCheck(platform, key, sessionId) {
+  const Q = require('./test-queue.js');
+  if (Q.config(module.exports).enabled && Q.config(module.exports).protectedDevices.includes(key)) return 'This device is protected for interactive use.';
   const lease = readLease(platform, key);
+  if (lease && Q.activeLease(module.exports, lease)) return 'A queued test owns this device; wait for cleanup or cancel its job.';
   if (lease && lease.sessionId === sessionId) return null;
   if (lease && lease.sessionId) {
     return `${platform === 'ios' ? 'Simulator' : 'Emulator'} ${key} is leased to ${friendlyName(lease.sessionId)} ("${lease.purpose || '?'}"). Message them (coord.js send) or acquire another device with \`coord.js sim acquire\`.`;
@@ -1429,7 +1452,14 @@ function computeGuardDecision(input, nowMs) {
   if (!cmd) return { deny: false };
 
   for (const m of classifyCommand(cmd)) {
-    if (m.kind === 'sim-boot') {
+    if (m.kind === 'xcode-job' && require('./test-queue.js').config(module.exports).enabled) {
+      return { deny: true, target: 'test-queue', reason: 'Xcode builds and simulator tests share host capacity. Submit through `coord.js test submit --session <you> --kind ios-test|build -- <command argv>`; check `test status <job-id>` for progress. A device lease alone does not reserve build capacity.' };
+    } else if (m.kind === 'sim-control' && require('./test-queue.js').config(module.exports).enabled) {
+      const cfg = require('./test-queue.js').config(module.exports);
+      if (m.key === 'all' || m.key === 'booted' || cfg.protectedDevices.includes(m.key)) return { deny: true, target: 'sim:' + m.key, reason: 'Protected or ambiguous simulator target; use the assigned agent UDID.' };
+      const reason = guardLeaseCheck('ios', m.key, id);
+      if (reason) return { deny: true, target: 'sim:' + m.key, reason };
+    } else if (m.kind === 'sim-boot') {
       const reason = guardLeaseCheck('ios', m.key, id);
       if (reason) return { deny: true, target: `sim:${m.key}`, reason };
     } else if (m.kind === 'avd-boot') {
@@ -1867,7 +1897,10 @@ function parseSimctlDevices(json) {
 }
 
 function listIosDevices(run = runQuiet) {
-  const json = run('xcrun', ['simctl', 'list', 'devices', 'available', '--json']);
+  const probe = run === runQuiet ? (file, args) => {
+    try { return execFileSync(file, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000 }); } catch { return null; }
+  } : run;
+  const json = probe('xcrun', ['simctl', 'list', 'devices', 'available', '--json']);
   return json ? parseSimctlDevices(json) : [];
 }
 
@@ -1954,12 +1987,14 @@ function releaseLease(platform, key) {
 function releaseSessionLeases(sessionId) {
   let n = 0;
   for (const l of readLeases()) {
-    if (l.sessionId === sessionId && releaseLease(l.platform, l.key)) n++;
+    if (l.sessionId === sessionId && !require('./test-queue.js').activeLease(module.exports, l) && releaseLease(l.platform, l.key)) n++;
   }
   return n;
 }
 
 function shutdownLeaseDevice(lease, deps = {}) {
+  const cfg = require('./test-queue.js').config(module.exports);
+  if (cfg.enabled && cfg.protectedDevices.some((s) => s === lease.key || s === lease.name)) return { ok: false, error: 'protected device' };
   const devices = listDevices(lease.platform, deps);
   const device = devices.find((d) => d.platform === lease.platform && d.key === lease.key);
   if (device && device.state !== 'booted') return { ok: true, alreadyShutdown: true };
@@ -1968,7 +2003,7 @@ function shutdownLeaseDevice(lease, deps = {}) {
       const ok = deps.shutdownDevice(lease, device);
       if (ok === false) throw new Error('shutdown command failed');
     } else if (lease.platform === 'ios') {
-      execFileSync('xcrun', ['simctl', 'shutdown', lease.key], { stdio: 'ignore' });
+      execFileSync('xcrun', ['simctl', 'shutdown', lease.key], { stdio: 'ignore', timeout: 15000 });
     } else {
       const serial = (device && device.serial) || lease.serial;
       if (!serial) throw new Error('booted emulator serial unavailable');
@@ -1994,7 +2029,7 @@ function quitSimulatorIfIdle(deps = {}) {
 }
 
 function shutdownAndReleaseLeases(sessionId, deps = {}, { key, keepFailed = true } = {}) {
-  const targets = readLeases().filter((lease) => lease.sessionId === sessionId && (!key || lease.key === key));
+  const targets = readLeases().filter((lease) => lease.sessionId === sessionId && (!key || lease.key === key) && !require('./test-queue.js').activeLease(module.exports, lease));
   const released = [];
   const failed = [];
   let touchedIos = false;
@@ -2033,6 +2068,7 @@ function pruneLeases(nowMs, deps = {}, { shutdown = false } = {}) {
   let n = 0;
   let stopped = 0;
   for (const l of readLeases()) {
+    if (require('./test-queue.js').activeLease(module.exports, l)) continue;
     if (l.sessionId && live.has(l.sessionId)) continue;
     const seen = Date.parse(l.lastSeen || l.acquiredAt || 0);
     const expired = !Number.isFinite(seen) || nowMs - seen > LEASE_TTL_MS;
@@ -2136,7 +2172,11 @@ const SEED_PROBE_LIMIT = 12;
 function acquireDevice(opts, deps = {}) {
   const { sessionId, sessionName, repo, purpose, platform, bundleId, prefer, nowMs, extra } = opts;
   pruneLeases(nowMs, deps, { shutdown: true });
-  const devices = listDevices(platform, deps);
+  const Q = require('./test-queue.js');
+  const cfg = Q.config(module.exports);
+  const devices = listDevices(platform, deps).filter((d) =>
+    (!opts.runtime || d.runtime === opts.runtime) && (!prefer || d.name.toLowerCase() === String(prefer).toLowerCase()) &&
+    (!cfg.enabled || d.platform !== 'ios' || Q.deviceAllowed(d, cfg, { runtime: opts.runtime, name: prefer })));
   if (!devices.length) return { ok: false, reason: 'no-devices', free: [], held: [] };
 
   const heldKeys = new Map(readLeases().map((l) => [`${l.platform}-${l.key}`, l]));
@@ -2146,10 +2186,13 @@ function acquireDevice(opts, deps = {}) {
   // explicitly asked for another.
   if (!extra) {
     const mine = readLeases().find((l) => l.sessionId === sessionId && (!platform || l.platform === platform));
-    if (mine) {
+    if (mine && !opts.queuedJob && devices.some((d) => d.key === mine.key && d.platform === mine.platform)) {
       const device = devices.find((d) => d.platform === mine.platform && d.key === mine.key) || mine;
       return { ok: true, device, lease: mine, affinity: 'already-held', reused: true };
     }
+  }
+  if (cfg.enabled && platform !== 'android' && !opts.queuedJob && readLeases().filter((l) => l.platform === 'ios').length >= cfg.maxSimulators) {
+    return { ok: false, reason: 'host-capacity', free: [], held: [] };
   }
   const free = devices.filter((d) => !heldKeys.has(`${d.platform}-${d.key}`));
   const held = devices.filter((d) => heldKeys.has(`${d.platform}-${d.key}`))
@@ -2190,7 +2233,7 @@ function acquireDevice(opts, deps = {}) {
     }
   }
   const ordered = [...head, ...rest.filter((d) => seeded.has(d)), ...rest.filter((d) => !seeded.has(d))];
-  const fallback = free.filter((d) => !head.includes(d) && !rest.includes(d)).sort(byReadiness);
+  const fallback = prefer ? [] : free.filter((d) => !head.includes(d) && !rest.includes(d)).sort(byReadiness);
 
   for (const device of [...ordered, ...fallback]) {
     const record = {
@@ -2206,6 +2249,7 @@ function acquireDevice(opts, deps = {}) {
       purpose: purpose || null,
       acquiredAt: new Date(nowMs).toISOString(),
       lastSeen: new Date(nowMs).toISOString(),
+      ...(opts.queuedJob ? { jobId: opts.queuedJob } : {}),
     };
     if (!tryLease(record)) continue; // lost the race to another session; try the next device
     const confirmed = head.includes(device) ? affinityState === 'verified' : seeded.has(device);
@@ -2270,7 +2314,11 @@ function cmdSim(args, nowMs, deps = {}) {
 
   if (sub === 'acquire') {
     const s = requireLiveSession(args, nowMs);
-    const result = acquireDevice({
+    const Q = require('./test-queue.js');
+    const unlock = Q.config(module.exports).enabled ? Q.lock(module.exports, 'queue') : () => {};
+    if (!unlock) throw new Error('test queue busy; retry acquisition');
+    let result;
+    try { result = acquireDevice({
       sessionId: s.sessionId,
       sessionName: friendlyName(s.sessionId),
       repo: s.repo,
@@ -2278,9 +2326,10 @@ function cmdSim(args, nowMs, deps = {}) {
       platform,
       bundleId: args['bundle-id'] || args.bundleId,
       prefer: args.name,
+      runtime: args.runtime,
       extra: args.extra === true || args.extra === 'true',
       nowMs,
-    }, deps);
+    }, deps); } finally { unlock(); }
 
     if (!result.ok) {
       const holders = (result.held || [])
@@ -2315,6 +2364,9 @@ function cmdSim(args, nowMs, deps = {}) {
 
   if (sub === 'release') {
     const s = requireLiveSession(args, nowMs);
+    if (readLeases().some((l) => l.sessionId === s.sessionId && require('./test-queue.js').activeLease(module.exports, l))) {
+      throw new Error('a queued test owns this lease; cancel its job or wait for cleanup');
+    }
     // Releasing stops the device. A lease handed back while the simulator keeps running is an
     // orphan: nothing downstream knows to stop it, because SessionEnd only reaps devices the
     // session still holds. --keep-booted opts out for a deliberate handoff.
@@ -5022,6 +5074,9 @@ function main() {
     else if (cmd === 'names') cmdNames(args);
     else if (cmd === 'doctor') cmdDoctor(args, nowMs);
     else if (cmd === 'sim') cmdSim(args, nowMs);
+    else if (cmd === 'test') {
+      require('./test-queue.js').cli(module.exports, process.argv.slice(2)).catch((e) => { console.error(`aircontrol error: ${e.message}`); process.exitCode = 1; });
+    }
     else if (cmd === 'ledger') cmdLedger(args, nowMs);
     else if (cmd === 'handoff') cmdHandoff(args, nowMs);
     else if (cmd === 'sync') cmdSync(args, nowMs);

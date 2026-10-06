@@ -81,6 +81,8 @@ test('installer merges Claude and Codex hooks and is idempotent', () => {
   assert.equal(aircontrolHandlers(installedClaude).length, 6);
   assert.equal(aircontrolHandlers(installedCodex).length, 6);
   assert.ok(fs.existsSync(path.join(codexDir, 'hooks', 'codex-listener.js')));
+  assert.ok(fs.existsSync(path.join(codexDir, 'hooks', 'test-queue.js')));
+  assert.ok(fs.existsSync(path.join(claudeDir, 'hooks', 'test-queue.js')));
   assert.ok(fs.existsSync(path.join(codexDir, 'hooks', 'node_modules', 'ws', 'index.js')));
   const cmuxLauncher = path.join(home, '.local', 'bin', 'aircontrol-cmux-codex');
   assert.ok(fs.existsSync(cmuxLauncher));
