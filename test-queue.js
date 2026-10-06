@@ -249,15 +249,44 @@ function readNew(name, offset) {
     return { text: buf.toString('utf8'), offset: size };
   } catch { return { text: '', offset }; } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
-function trackProgress(logPath, out, intervalMs = 3000) {
+// Runners such as a project verify script send xcodebuild output to their own files and name
+// the current one in the phase file (`{ phase, log }`), so every log seen is followed, each with
+// its own offset and partial line.
+function progressReader(primary, phaseFile, fromEnd) {
+  const sources = new Map();
+  const add = (name) => {
+    if (!name || sources.has(name)) return;
+    let offset = 0;
+    if (fromEnd) try { offset = fs.statSync(name).size; } catch {}
+    sources.set(name, { offset, partial: '' });
+  };
+  add(primary);
   let state = emptyProgress();
-  let offset = (() => { try { return fs.statSync(logPath).size; } catch { return 0; } })();
+  return {
+    read() {
+      const named = readJson(phaseFile)?.log;
+      if (typeof named === 'string' && path.isAbsolute(named)) add(named);
+      const events = [];
+      for (const [name, src] of sources) {
+        const chunk = readNew(name, src.offset);
+        if (!chunk.text) continue;
+        src.offset = chunk.offset;
+        const parsed = parseProgress(chunk.text, { ...state, partial: src.partial });
+        src.partial = parsed.progress.partial;
+        state = { ...parsed.progress, partial: '' };
+        events.push(...parsed.events);
+      }
+      return { progress: state, events };
+    },
+  };
+}
+function trackProgress(logPath, out, phaseFile, intervalMs = 3000) {
+  const reader = progressReader(logPath, phaseFile, true);
+  let state = emptyProgress();
   const tick = () => {
-    const chunk = readNew(logPath, offset);
-    if (!chunk.text) return;
-    offset = chunk.offset;
-    state = parseProgress(chunk.text, state).progress;
-    try { atomic(out, progressSummary(state)); } catch {}
+    const { progress, events } = reader.read();
+    state = progress;
+    if (events.length || progress.ui.passed || progress.unit.done) try { atomic(out, progressSummary(state)); } catch {}
   };
   const timer = setInterval(tick, intervalMs);
   timer.unref?.();
@@ -335,7 +364,7 @@ async function watch(C, id, opts = {}) {
   const write = opts.write || ((line) => console.log(line));
   const interval = opts.intervalMs ?? 2000;
   let last = null;
-  let offset = 0;
+  const reader = progressReader(status(C, id).log, path.join(root(C), id + '.phase.json'), false);
   let state = emptyProgress();
   for (;;) {
     const j = status(C, id);
@@ -345,15 +374,9 @@ async function watch(C, id, opts = {}) {
       write(`⏱ ${formatClock(j.elapsedMs)} ${where}${progress ? ' · ' + progress : ''}`);
       last = where;
     }
-    if (!opts.quiet) {
-      const chunk = readNew(j.log, offset);
-      offset = chunk.offset;
-      if (chunk.text) {
-        const parsed = parseProgress(chunk.text, state);
-        state = parsed.progress;
-        for (const e of parsed.events) { const line = renderEvent(e); if (line) write(line); }
-      }
-    }
+    const parsed = reader.read();
+    state = parsed.progress;
+    if (!opts.quiet) for (const e of parsed.events) { const line = renderEvent(e); if (line) write(line); }
     if (TERMINAL.has(j.state)) {
       const progress = formatProgress({ ...j, progress: j.progress || progressSummary(state) });
       write(`done: ${j.state} in ${formatClock(j.elapsedMs)}${progress ? ' · ' + progress : ''}${j.error ? ' · ' + j.error : ''}`);
@@ -411,7 +434,7 @@ async function work(C, id) {
     }
     const begin = Date.now();
     job.phase = 'command'; job.commandStartedAt = begin; atomic(file(C, id), job);
-    tracker = trackProgress(job.log, path.join(root(C), id + '.progress.json'));
+    tracker = trackProgress(job.log, path.join(root(C), id + '.progress.json'), env.AIRCONTROL_TEST_PHASE_PATH);
     await execute(commandForJob(job.command, job, config(C)), job, env, logFd);
     job.timings.commandMs = Date.now() - begin;
     job.result = 'succeeded';

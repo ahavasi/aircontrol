@@ -258,3 +258,19 @@ test('watch replays a finished job and exits with its result', async () => {
   assert.ok(out.includes('✅ unit tests: 1183 passed'));
   assert.match(out[out.length - 1], /^done: failed in 2:05 · 10 UI \(1 failed\) · 1183 unit ✓ · command exited 65$/);
 });
+
+test('watch follows the log a runner names in its phase file', async () => {
+  setup();
+  const id = 'test_dddddddddddddddd';
+  fs.mkdirSync(Q.root(C), { recursive: true });
+  const log = path.join(Q.root(C), id + '.log');
+  const side = path.join(Q.root(C), id + '-test.log');
+  fs.writeFileSync(log, 'test: ' + path.basename(side) + '\n');
+  fs.writeFileSync(side, fixture);
+  Q.atomic(path.join(Q.root(C), id + '.phase.json'), { phase: 'test', log: side });
+  Q.atomic(Q.file(C, id), { id, sequence: 1, state: 'succeeded', phase: 'cleanup', kind: 'ios-test', command: ['x'], cwd: __dirname, owner: 'o', ownerName: 'o', log, startedAt: 1000, finishedAt: 61000 });
+  const out = [];
+  assert.equal(await Q.watch(C, id, { write: (l) => out.push(l), intervalMs: 1 }), 0);
+  assert.ok(out.includes('✅ unit tests: 1183 passed'));
+  assert.match(out[out.length - 1], /^done: succeeded in 1:00 · 10 UI \(1 failed\) · 1183 unit ✓$/);
+});
