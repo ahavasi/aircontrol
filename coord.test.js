@@ -2383,7 +2383,7 @@ test('an explicit --name outranks a remembered affinity', () => {
   const now = Date.now();
   C.writeAffinity({ repos: { rk: { platform: 'ios', key: 'UDID-A', name: 'iPhone 17', bundleId: 'b' } } });
   const deps = stubDeps([IOS_A, IOS_B], true);
-  const res = C.acquireDevice({ sessionId: 's', repo: 'rk', prefer: 'Pro', nowMs: now }, deps);
+  const res = C.acquireDevice({ sessionId: 's', repo: 'rk', prefer: IOS_B.name, nowMs: now }, deps);
   assert.equal(res.device.key, 'UDID-B'); // iPhone 17 Pro, not the affinity's plain iPhone 17
   assert.equal(C.affinityFor('rk').key, 'UDID-B'); // and the explicit choice becomes the new memory
 });

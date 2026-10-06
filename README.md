@@ -339,8 +339,7 @@ A denial names the conflicting session and the command to run next; denials are 
 in the session's `blockedAttempts` and appended to `guard.log`. Everything else is
 *silence* — guard never emits an explicit allow, so stricter hooks and user permission
 rules keep the last word, and any internal guard error fails open. Known limits:
-`xcodebuild -destination` boots a simulator internally without a literal `simctl boot`,
-which guard cannot see; intent and custom resources remain advisory.
+When queued testing is enabled, direct Xcode builds and tests are denied, including implicit simulator boots. Commands hidden inside arbitrary scripts cannot be inferred by a shell guard; only configured trusted runners may be submitted. Intent and custom resources remain advisory.
 
 ### Simulator leases
 
@@ -362,9 +361,7 @@ node ~/.claude/hooks/coord.js sim release --session captain-boopsnoot
   tests** and still exits 0.
 - **Affinity.** The device a repo last used is remembered in `sim-affinity.json` and preferred on
   the next acquire, so agents reuse the simulator that already carries the app's data instead of
-  seeding a cold one. Affinity is *verified*, not trusted: a single `simctl get_app_container`
-  call confirms the app is really installed, and a miss falls through to a free device and
-  rewrites the mapping.
+  seeding a cold one. Affinity is *verified*, not trusted: installed app bundles are read from disk, including on shut-down devices. A stale mapping is dropped. Explicit device names and runtimes are strict requirements.
 - **Denial is loud.** A failed acquire prints the holder and exits non-zero, so a script that
   ignores the message still fails.
 - **Cleanup shuts down what it owns.** `sim release` shuts down only the caller's leased devices
@@ -372,13 +369,29 @@ node ~/.claude/hooks/coord.js sim release --session captain-boopsnoot
   A real `SessionEnd` does the same best-effort cleanup in a detached child, so a slow
   `simctl shutdown` cannot outlast the hook's timeout and get it cancelled; `/clear` only
   releases, because the session carries on. Pass `--keep-booted` to hand a device back still running.
-- **A lease never outlives its holder, and neither does its device.** `sweep` clears any lease whose
-  session has gone stale, and the next `sim list` or `sim acquire` shuts down the device that lease
-  left booted. A live holder is always skipped, however old its lease, so this cannot stop a
-  simulator that work is still running on.
+- **A lease never outlives its holder, and neither does its device.** a lease is reclaimed only after its holder is absent and its two-hour lease timeout has elapsed. The next `sim list` or `sim acquire` shuts down the orphaned device. Active queued jobs retain their leases regardless of session heartbeat age.
 
 Enumeration shells out to `simctl` / `adb` only inside `sim` subcommands and SessionEnd cleanup.
 A missing Xcode or Android SDK yields an empty list, not an error.
+
+### Queued Xcode testing
+
+The opt-in host-local queue is shared by Claude Code and Codex through the same state directory. Configure one reusable, dedicated agent device first; never select an interactive device:
+
+```bash
+node ~/.codex/hooks/coord.js test configure --enabled true --devices Aircontrol-Agent --runtime "iOS 26.5" --max-xcode 1 --max-simulators 1 --jobs 4
+node ~/.codex/hooks/coord.js test submit --session <name> --kind ios-test -- xcodebuild -project App.xcodeproj -scheme App test
+node ~/.codex/hooks/coord.js test status <job-id> --json
+node ~/.codex/hooks/coord.js test cancel <job-id> --session <name>
+```
+
+Submission returns immediately; FIFO jobs acquire their device when admitted. Raw Xcode commands receive the assigned UDID and bounded build operations, with parallel test runners disabled. Use `--kind build` for generic-destination compilation without a simulator. `testing.protectedDevices` accepts exact names or UDIDs; `allowedNames` and `runtime` constrain selection. Manual iOS leases consume simulator capacity, and unmanaged Xcode processes must drain before queued work starts.
+
+Only Xcode or `testing.runnerScripts` (relative to the submitted worktree, default `scripts/verify.mjs`) can run through the queue. Trusted Node runners consume `AIRCONTROL_SIM_UDID`, `AIRCONTROL_TEST_JOBS`, and `AIRCONTROL_TEST_JOB_ID`; they must enforce those settings for every subprocess. Queue scripts are not a security boundary against intentionally modified project code. Source build/test caching belongs to the project runner.
+
+The dispatcher and job supervisors are detached, short-lived processes, not a permanent service. Queue locks use unique per-contender files and process identities. Cancellation targets only the job process group. If a supervisor dies, its remaining descendants retain capacity; cleanup retries after they exit. A failed simulator shutdown retains both capacity and lease. Status reports phase, elapsed time, queue position, owner, device and log. Jobs older than 15 minutes are marked slow without being killed. Project runners may write `AIRCONTROL_TEST_METRICS_PATH` with build/test timing details.
+
+Disable admission with `test configure --enabled false` during rollback; existing jobs still finish cleanup. Reinstall from the source checkout to update both harnesses. No remote scheduling or cross-worktree artifact sharing is involved.
 
 ### Work ledger
 
