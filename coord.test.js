@@ -1036,6 +1036,12 @@ test('nudge and inject render an identical message line', () => {
 function guardOut(input, now) {
   return captureStdout(() => C.cmdGuard(input, now));
 }
+test('patch content is not a shell command while patch paths remain guarded', () => {
+  const command = '*** Begin Patch\n*** Update File: /tmp/example.js\n+const argv = ["xcodebuild", "test"];\n*** End Patch';
+  const input = { session_id: 'patch-fixture', tool_name: 'apply_patch', tool_input: { command } };
+  assert.deepEqual(C.toolInputPaths(input), ['/tmp/example.js']);
+  assert.deepEqual(C.computeGuardDecision(input, Date.now()), { deny: false });
+});
 
 function denyReason(out) {
   assert.notEqual(out.trim(), '', 'expected a deny, got silence');

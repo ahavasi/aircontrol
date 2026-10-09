@@ -21,6 +21,81 @@ function setup(patch = {}) {
 const options = (kind = 'build') => ({ kind, command: [process.execPath, '-e', 'process.exit(0)'], cwd: __dirname });
 const noRunner = { ensureRunner() {}, listDevices: () => [device], allowCommand: true };
 const deps = { listIos: () => [device], externalBuilds: () => 0, shutdownDevice: () => true, appInstalled: () => false };
+test('maintenance prevents dispatcher startup and stale maintenance does not block recovery', async () => {
+  setup();
+  const marker = path.join(Q.root(C), 'maintenance.json');
+  Q.atomic(marker, { pid: process.pid, birth: Q.identity(process.pid) });
+  assert.equal(Q.maintenanceActive(C), true);
+  await Q.dispatch(C);
+  assert.equal(Q.lockEntries(C, 'runner').length, 0);
+  Q.atomic(marker, { pid: process.pid, birth: 'different process' });
+  assert.equal(Q.maintenanceActive(C), false);
+});
+test('overlap permits one build and one test-only job and preserves serial default', () => {
+  setup({ overlap: true });
+  const cfg = Q.config(C);
+  const active = (kind) => [{ state: 'running', kind }];
+  assert.equal(Q.capacity(C, cfg, active('build'), 'ios-test-only', 0), true);
+  assert.equal(Q.capacity(C, cfg, active('ios-test-only'), 'build', 0), true);
+  for (const kind of ['build', 'ios-test-only', 'ios-test']) assert.equal(Q.capacity(C, cfg, active(kind), kind, 0), false);
+  assert.equal(Q.capacity(C, cfg, active('ios-test'), 'build', 0), false);
+  assert.equal(Q.capacity(C, cfg, active('ios-test'), 'ios-test-only', 0), false);
+  assert.equal(Q.capacity(C, cfg, [], 'build', 1), false);
+  assert.equal(Q.capacity(C, { ...cfg, overlap: false }, active('ios-test-only'), 'build', 0), false);
+  C.tryLease({ ...device, sessionId: 'manual', acquiredAt: new Date().toISOString() });
+  assert.equal(Q.capacity(C, { ...cfg, maxSimulators: 2 }, [], 'ios-test-only', 0), false);
+});
+test('eligible jobs bypass simulator waits and batch runs after three interactive dispatches', async () => {
+  const session = setup({ overlap: true });
+  const blocked = await Q.submit(C, options('ios-test-only'), session, noRunner);
+  const batch = await Q.submit(C, { ...options(), priority: 'batch' }, session, noRunner);
+  const fast = await Q.submit(C, options(), session, noRunner);
+  C.tryLease({ ...device, sessionId: 'manual', acquiredAt: new Date().toISOString() });
+  assert.equal(Q.chooseJob(C, Q.config(C), Q.jobs(C), 0).id, fast.id);
+  Q.atomic(path.join(Q.root(C), 'scheduler.json'), { interactiveStreak: 3 });
+  assert.equal(Q.chooseJob(C, Q.config(C), Q.jobs(C), 0).id, batch.id);
+  assert.equal(Q.status(C, blocked.id).waitReason, 'host capacity');
+});
+test('pipeline workspace ownership survives gaps between chunks and ends after termination', async () => {
+  const session = setup();
+  const pipeline = await Q.submitPipeline(C, { cwd: __dirname, resource: __dirname, jobs: [options(), { ...options('ios-test-only'), dependsOn: [0] }] }, session, noRunner);
+  const competitor = await Q.submit(C, { ...options(), resource: __dirname }, session, noRunner);
+  const first = Q.jobs(C)[0];
+  Object.assign(first, { state: 'succeeded', startedAt: 1 }); Q.atomic(Q.file(C, first.id), first);
+  assert.equal(Q.resourceBusy(competitor, Q.jobs(C)), true);
+  const next = Q.jobs(C)[1];
+  assert.equal(Q.resourceBusy(next, Q.jobs(C)), false);
+  assert.equal(Q.dependencyState(next, Q.jobs(C)), null);
+  await Q.cancel(C, pipeline.jobs[1].id, session.sessionId);
+  assert.equal(Q.resourceBusy(competitor, Q.jobs(C)), false);
+});
+test('pipeline validation is atomic and cancelled dependencies block descendants', async () => {
+  const session = setup();
+  await assert.rejects(Q.submitPipeline(C, { cwd: __dirname, resource: __dirname, jobs: [options(), { ...options(), dependsOn: [2] }] }, session, noRunner), /earlier/);
+  assert.equal(Q.jobs(C).length, 0);
+  const pipeline = await Q.submitPipeline(C, { cwd: __dirname, resource: __dirname, jobs: [options(), { ...options(), dependsOn: [0] }, { ...options(), dependsOn: [1] }] }, session, noRunner);
+  await Q.cancel(C, pipeline.jobs[0].id, session.sessionId);
+  await Q.tick(C, deps);
+  assert.deepEqual(Q.jobs(C).map((j) => j.state), ['cancelled', 'blocked', 'blocked']);
+  assert.match(Q.status(C, pipeline.jobs[2].id).error, /dependency/);
+});
+test('test-only commands cannot compile and resource siblings cannot overlap', () => {
+  setup();
+  assert.throws(() => Q.validateCommand(['xcodebuild', 'test'], 'ios-test-only', __dirname, Q.config(C)), /test-without-building/);
+  const job = { id: 'b', resource: __dirname, pipelineId: 'same' };
+  for (const state of ['running', 'cleaning']) assert.equal(Q.resourceBusy(job, [{ ...job, id: 'a', state }]), true);
+});
+test('pipeline status is scoped and pipeline cancellation is owner checked and atomic', async () => {
+  const session = setup();
+  const pipeline = await Q.submitPipeline(C, { cwd: __dirname, resource: __dirname, jobs: [options(), { ...options(), dependsOn: [0] }] }, session, noRunner);
+  const unrelated = await Q.submit(C, options(), session, noRunner);
+  assert.equal(Q.status(C, pipeline.id).length, 2);
+  await assert.rejects(Q.cancel(C, pipeline.id, 'other'), /only the submitting/);
+  assert.equal(Q.status(C, pipeline.id)[0].state, 'queued');
+  await Q.cancel(C, pipeline.id, session.sessionId);
+  assert.deepEqual(Q.status(C, pipeline.id).map(j => j.state), ['cancelled', 'cancelled']);
+  assert.equal(Q.status(C, unrelated.id).state, 'queued');
+});
 async function waitFor(fn, timeout = 12000) {
   const begin = Date.now();
   while (Date.now() - begin < timeout) { if (fn()) return; await new Promise((r) => setTimeout(r, 100)); }
@@ -227,6 +302,9 @@ test('fingerprint ignores per-worktree paths and estimate takes the median run',
   assert.equal(Q.fingerprint(base), Q.fingerprint({ ...base, cwd: '/b', command: ['xcodebuild', '-scheme', 'App', '-derivedDataPath', '/b/DD', 'test'] }));
   assert.notEqual(Q.fingerprint(base), Q.fingerprint({ ...base, command: ['xcodebuild', '-scheme', 'Other', 'test'] }));
   assert.equal(Q.estimate(base, null), null);
+  const stage = { ...base, command: ['node', 'scripts/verify.mjs', '--run-stage', 'test', '--pipeline', '/one.json', '--chunk', 'HomeTests'] };
+  assert.equal(Q.fingerprint(stage), Q.fingerprint({ ...stage, command: stage.command.map(s => s === '/one.json' ? '/two.json' : s) }));
+  assert.notEqual(Q.fingerprint(stage), Q.fingerprint({ ...stage, command: stage.command.map(s => s === 'HomeTests' ? 'ScanTests' : s) }));
   for (const ms of [300000, 900000, 600000]) Q.recordHistory(C, { ...base, timings: { commandMs: ms }, progress: { ui: { passed: 5, failed: 1 }, unit: { total: 1183 } } });
   const history = JSON.parse(fs.readFileSync(path.join(Q.root(C), 'history.json'), 'utf8'));
   assert.deepEqual(Q.estimate(base, history), { commandMs: 600000, ui: 6, unit: 1183 });

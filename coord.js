@@ -1449,7 +1449,7 @@ function computeGuardDecision(input, nowMs) {
     }
   }
 
-  const cmd = commandText(input);
+  const cmd = input.tool_name === 'apply_patch' ? '' : commandText(input);
   if (!cmd) return { deny: false };
 
   for (const m of classifyCommand(cmd)) {
