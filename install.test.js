@@ -5,7 +5,33 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
+
+test('paused installation preserves queued records and retires only the idle dispatcher', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-install-paused-'));
+  const jobs = path.join(home, '.claude/agents/test-jobs');
+  fs.mkdirSync(jobs, { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude/agents/config.json'), JSON.stringify({ testing: { enabled: false } }));
+  const record = JSON.stringify({ id: 'test_0123456789abcdef', state: 'queued', owner: 'other-agent' });
+  const jobFile = path.join(jobs, 'test_0123456789abcdef.json');
+  fs.writeFileSync(jobFile, record);
+  const runner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+  try {
+    const Q = require('./test-queue.js');
+    const birth = Q.identity(runner.pid);
+    assert.ok(birth);
+    fs.writeFileSync(path.join(jobs, 'runner.lock-' + runner.pid + '-fixture'), JSON.stringify({ pid: runner.pid, birth, ticket: 1 }));
+    await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(__dirname, 'install.js'), '--paused-queue'], { env: { ...process.env, AIRCONTROL_HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] });
+      let error = ''; child.stderr.on('data', data => { error += data; });
+      child.on('error', reject); child.on('exit', code => code === 0 ? resolve() : reject(new Error(error)));
+    });
+    assert.equal(fs.readFileSync(jobFile, 'utf8'), record);
+    assert.equal(Q.identity(runner.pid), null);
+    assert.equal(fs.existsSync(path.join(jobs, 'maintenance.json')), false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(home, '.claude/agents/config.json'))).testing.enabled, false);
+  } finally { runner.kill('SIGKILL'); fs.rmSync(home, { recursive: true, force: true }); }
+});
 
 function count(text, needle) {
   return text.split(needle).length - 1;

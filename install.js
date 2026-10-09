@@ -710,6 +710,8 @@ latter). Idempotent; makes .bak-aircontrol backups.
   --names <style>       Session name style; skips the interactive prompt.
   --codex-daemon        Install and start Codex's durable local daemon for live names
                         and idle-session message delivery (no remote control).
+  --paused-queue       Preserve queued jobs when testing.enabled is false and no job
+                        is active; restart only the idle dispatcher during installation.
   --no-mirror-global    Stop mirroring ~/.claude/CLAUDE.md into ~/.codex/AGENTS.md
                         (remembered in config.json; removes the existing mirror block).
   --purge               With uninstall: also delete ~/.claude/agents (roster, messages,
@@ -717,7 +719,7 @@ latter). Idempotent; makes .bak-aircontrol backups.
   --help, -h            Print this and install nothing.
 `;
 
-const KNOWN_FLAGS = new Set(['--names', '--no-mirror-global', '--codex-daemon']);
+const KNOWN_FLAGS = new Set(['--names', '--no-mirror-global', '--codex-daemon', '--paused-queue']);
 
 function codexLaunchAgent(binary) {
   const xml = s => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
@@ -900,18 +902,40 @@ function main(argv = process.argv.slice(2)) {
   const queueContext = { ...coord, configFile: () => configPath };
   const releaseQueue = queue.lock(queueContext, 'queue');
   if (!releaseQueue) throw new Error('test queue busy; retry installation');
+  const maintenance = path.join(queue.root(queueContext), 'maintenance.json');
+  let maintaining = false;
   try {
+    const paused = argv.includes('--paused-queue');
+    const pending = queue.jobs(queueContext);
+    if (paused && (queue.config(queueContext).enabled || pending.some(job => queue.ACTIVE.has(job.state)))) throw new Error('paused-queue installation requires testing disabled and all active jobs finished');
     const sourceQueue = fs.readFileSync(path.join(__dirname, 'test-queue.js'), 'utf8');
     const changingScheduler = [claudeTarget, codexTarget].some((target) => {
       const installed = path.join(path.dirname(target), 'test-queue.js');
       return fs.existsSync(installed) && fs.readFileSync(installed, 'utf8') !== sourceQueue;
     });
-    if (changingScheduler && queue.jobs(queueContext).some((job) => job.state === 'queued' || queue.ACTIVE.has(job.state))) {
+    if (changingScheduler && !paused && pending.some((job) => job.state === 'queued' || queue.ACTIVE.has(job.state))) {
       throw new Error('test queue must drain before installing a scheduler update; running jobs were left untouched');
     }
+    const dispatchers = paused ? queue.lockEntries(queueContext, 'runner').map(entry => {
+      const owner = JSON.parse(fs.readFileSync(entry.target, 'utf8'));
+      if (!owner.birth || queue.identity(owner.pid) !== owner.birth || owner.pid === process.pid) throw new Error('cannot verify idle dispatcher identity');
+      return owner;
+    }) : [];
+    if (paused) { queue.atomic(maintenance, { pid: process.pid, birth: queue.identity(process.pid) }); maintaining = true; }
     copyRuntime(claudeTarget);
     copyRuntime(codexTarget);
-  } finally { releaseQueue(); }
+    for (const owner of dispatchers) {
+      if (queue.identity(owner.pid) !== owner.birth) continue;
+      process.kill(owner.pid, 'SIGTERM');
+      const deadline = Date.now() + 5000;
+      while (queue.alive(owner.pid, owner.birth) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      if (queue.alive(owner.pid, owner.birth)) throw new Error('idle dispatcher did not exit; leave testing disabled');
+    }
+    if (paused) queue.lockEntries(queueContext, 'runner');
+  } finally {
+    if (maintaining) fs.rmSync(maintenance, { force: true });
+    releaseQueue();
+  }
   installCmuxRemoteLauncher();
   installRepoSkills();
   linkGlobalSkills();

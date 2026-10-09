@@ -21,6 +21,16 @@ function setup(patch = {}) {
 const options = (kind = 'build') => ({ kind, command: [process.execPath, '-e', 'process.exit(0)'], cwd: __dirname });
 const noRunner = { ensureRunner() {}, listDevices: () => [device], allowCommand: true };
 const deps = { listIos: () => [device], externalBuilds: () => 0, shutdownDevice: () => true, appInstalled: () => false };
+test('maintenance prevents dispatcher startup and stale maintenance does not block recovery', async () => {
+  setup();
+  const marker = path.join(Q.root(C), 'maintenance.json');
+  Q.atomic(marker, { pid: process.pid, birth: Q.identity(process.pid) });
+  assert.equal(Q.maintenanceActive(C), true);
+  await Q.dispatch(C);
+  assert.equal(Q.lockEntries(C, 'runner').length, 0);
+  Q.atomic(marker, { pid: process.pid, birth: 'different process' });
+  assert.equal(Q.maintenanceActive(C), false);
+});
 test('overlap permits one build and one test-only job and preserves serial default', () => {
   setup({ overlap: true });
   const cfg = Q.config(C);

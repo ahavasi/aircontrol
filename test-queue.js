@@ -142,7 +142,12 @@ function chooseJob(C, cfg, all, external) {
   const batch = eligible.find((j) => j.priority === 'batch');
   return streak >= 3 ? batch || interactive : interactive || batch;
 }
+function maintenanceActive(C) {
+  const owner = readJson(path.join(root(C), 'maintenance.json'));
+  return !!owner && alive(owner.pid, owner.birth);
+}
 function ensureRunner(C) {
+  if (maintenanceActive(C)) return;
   if (lockEntries(C, 'runner').length) return;
   const child = spawn(process.execPath, [path.join(__dirname, 'test-queue.js'), 'dispatch'], {
     detached: true, stdio: 'ignore', env: process.env,
@@ -606,6 +611,7 @@ async function tick(C, deps = {}) {
   });
 }
 async function dispatch(C, deps = {}) {
+  if (maintenanceActive(C)) return;
   let release;
   for (let i = 0; i < 10 && !release; i++) { release = lock(C, 'runner'); if (!release) await delay(50); }
   if (!release) return;
@@ -671,7 +677,7 @@ async function cli(C, argv) {
   if (args.json) console.log(JSON.stringify(result));
   else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
 }
-module.exports = { emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);
