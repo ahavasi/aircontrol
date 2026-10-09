@@ -115,7 +115,7 @@ function capacity(C, cfg, existing, kind, external = externalBuilds(existing)) {
     if (kind !== 'ios-test-only' && active.some((j) => j.kind !== 'ios-test-only')) return false;
     if (simulatorJob(kind) && active.some((j) => simulatorJob(j.kind))) return false;
   } else if (active.length >= cfg.maxXcode) return false;
-  return !simulatorJob(kind) || manualCount(C) + active.filter((j) => simulatorJob(j.kind)).length < cfg.maxSimulators;
+  return !simulatorJob(kind) || manualCount(C) + active.filter((j) => simulatorJob(j.kind)).length < (cfg.overlap ? 1 : cfg.maxSimulators);
 }
 function dependencyState(job, all) {
   const dependencies = (job.dependsOn || []).map((id) => all.find((j) => j.id === id));
@@ -368,7 +368,7 @@ function trackProgress(logPath, out, phaseFile, intervalMs = 3000) {
 
 // Durations are keyed on what the command does, not where it writes: derived data, result
 // bundles, destinations and signing keys differ between worktrees running the same suite.
-const VOLATILE = new Set(['-derivedDataPath', '-destination', '-resultBundlePath', '-authenticationKeyPath', '-authenticationKeyID', '-authenticationKeyIssuerID']);
+const VOLATILE = new Set(['-derivedDataPath', '-destination', '-resultBundlePath', '-authenticationKeyPath', '-authenticationKeyID', '-authenticationKeyIssuerID', '--pipeline']);
 function fingerprint(job) {
   const argv = [];
   for (let i = 0; i < (job.command || []).length; i++) {

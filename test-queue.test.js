@@ -32,6 +32,8 @@ test('overlap permits one build and one test-only job and preserves serial defau
   assert.equal(Q.capacity(C, cfg, active('ios-test'), 'ios-test-only', 0), false);
   assert.equal(Q.capacity(C, cfg, [], 'build', 1), false);
   assert.equal(Q.capacity(C, { ...cfg, overlap: false }, active('ios-test-only'), 'build', 0), false);
+  C.tryLease({ ...device, sessionId: 'manual', acquiredAt: new Date().toISOString() });
+  assert.equal(Q.capacity(C, { ...cfg, maxSimulators: 2 }, [], 'ios-test-only', 0), false);
 });
 test('eligible jobs bypass simulator waits and batch runs after three interactive dispatches', async () => {
   const session = setup({ overlap: true });
@@ -290,6 +292,9 @@ test('fingerprint ignores per-worktree paths and estimate takes the median run',
   assert.equal(Q.fingerprint(base), Q.fingerprint({ ...base, cwd: '/b', command: ['xcodebuild', '-scheme', 'App', '-derivedDataPath', '/b/DD', 'test'] }));
   assert.notEqual(Q.fingerprint(base), Q.fingerprint({ ...base, command: ['xcodebuild', '-scheme', 'Other', 'test'] }));
   assert.equal(Q.estimate(base, null), null);
+  const stage = { ...base, command: ['node', 'scripts/verify.mjs', '--run-stage', 'test', '--pipeline', '/one.json', '--chunk', 'HomeTests'] };
+  assert.equal(Q.fingerprint(stage), Q.fingerprint({ ...stage, command: stage.command.map(s => s === '/one.json' ? '/two.json' : s) }));
+  assert.notEqual(Q.fingerprint(stage), Q.fingerprint({ ...stage, command: stage.command.map(s => s === 'HomeTests' ? 'ScanTests' : s) }));
   for (const ms of [300000, 900000, 600000]) Q.recordHistory(C, { ...base, timings: { commandMs: ms }, progress: { ui: { passed: 5, failed: 1 }, unit: { total: 1183 } } });
   const history = JSON.parse(fs.readFileSync(path.join(Q.root(C), 'history.json'), 'utf8'));
   assert.deepEqual(Q.estimate(base, history), { commandMs: 600000, ui: 6, unit: 1183 });
