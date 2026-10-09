@@ -896,8 +896,22 @@ function main(argv = process.argv.slice(2)) {
   if (coord.parseArgs(argv)['no-mirror-global']) writeConfig({ mirrorGlobalDoc: false });
   writeConfig({ nameStyle: resolveNameStyle() });
 
-  copyRuntime(claudeTarget);
-  copyRuntime(codexTarget);
+  const queue = require('./test-queue.js');
+  const queueContext = { ...coord, configFile: () => configPath };
+  const releaseQueue = queue.lock(queueContext, 'queue');
+  if (!releaseQueue) throw new Error('test queue busy; retry installation');
+  try {
+    const sourceQueue = fs.readFileSync(path.join(__dirname, 'test-queue.js'), 'utf8');
+    const changingScheduler = [claudeTarget, codexTarget].some((target) => {
+      const installed = path.join(path.dirname(target), 'test-queue.js');
+      return fs.existsSync(installed) && fs.readFileSync(installed, 'utf8') !== sourceQueue;
+    });
+    if (changingScheduler && queue.jobs(queueContext).some((job) => job.state === 'queued' || queue.ACTIVE.has(job.state))) {
+      throw new Error('test queue must drain before installing a scheduler update; running jobs were left untouched');
+    }
+    copyRuntime(claudeTarget);
+    copyRuntime(codexTarget);
+  } finally { releaseQueue(); }
   installCmuxRemoteLauncher();
   installRepoSkills();
   linkGlobalSkills();

@@ -10,6 +10,23 @@ const { execFileSync } = require('child_process');
 function count(text, needle) {
   return text.split(needle).length - 1;
 }
+test('scheduler installation waits for queued and active jobs without replacing runtime', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-install-drain-'));
+  const hooks = path.join(home, '.codex/hooks');
+  const jobs = path.join(home, '.claude/agents/test-jobs');
+  fs.mkdirSync(hooks, { recursive: true }); fs.mkdirSync(jobs, { recursive: true });
+  const runtime = path.join(hooks, 'test-queue.js');
+  fs.writeFileSync(runtime, 'old scheduler');
+  try {
+    for (const state of ['queued', 'running', 'cleaning']) {
+      fs.writeFileSync(path.join(jobs, 'test_0123456789abcdef.json'), JSON.stringify({ id: 'test_0123456789abcdef', state }));
+      assert.throws(() => execFileSync(process.execPath, [path.join(__dirname, 'install.js')], {
+        env: { ...process.env, AIRCONTROL_HOME: home }, stdio: 'pipe'
+      }), /test queue must drain/);
+      assert.equal(fs.readFileSync(runtime, 'utf8'), 'old scheduler');
+    }
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
 
 function aircontrolHandlers(config) {
   return Object.values(config.hooks || {}).flatMap((entries) =>

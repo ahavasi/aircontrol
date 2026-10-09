@@ -5,8 +5,9 @@ const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
 
 const ACTIVE = new Set(['starting', 'running', 'cleaning']);
-const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
-const DEFAULTS = { enabled: false, maxXcode: 1, maxSimulators: 1, jobs: 4, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'] };
+const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'blocked']);
+const DEFAULTS = { enabled: false, overlap: false, maxXcode: 1, maxSimulators: 1, jobs: 4, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'] };
+const simulatorJob = (kind) => ['ios-test', 'ios-test-only'].includes(kind);
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const root = (C) => path.join(path.dirname(C.configFile()), 'test-jobs');
 const file = (C, id) => {
@@ -22,6 +23,7 @@ function atomic(name, value) {
 }
 function config(C) {
   const result = { ...DEFAULTS, ...(readJson(C.configFile()) || {}).testing };
+  if (typeof result.overlap !== 'boolean') throw new Error('testing.overlap must be boolean');
   for (const key of ['maxXcode', 'maxSimulators', 'jobs']) {
     if (!Number.isInteger(result[key]) || result[key] < 1) throw new Error('testing.' + key + ' must be a positive integer');
   }
@@ -33,7 +35,7 @@ function config(C) {
 function jobs(C) {
   fs.mkdirSync(root(C), { recursive: true });
   return fs.readdirSync(root(C)).filter((s) => /^test_[a-f0-9]{16}\.json$/.test(s))
-    .map((s) => readJson(path.join(root(C), s))).filter(Boolean).sort((a, b) => a.sequence - b.sequence);
+    .map((s) => readJson(path.join(root(C), s))).filter((j) => j && (!j.pipelineId || fs.existsSync(path.join(root(C), j.pipelineId + '.json')))).sort((a, b) => a.sequence - b.sequence);
 }
 function identity(pid) {
   if (!Number.isInteger(pid) || pid < 1) return null;
@@ -108,8 +110,37 @@ function externalBuilds(existing = []) {
 }
 function capacity(C, cfg, existing, kind, external = externalBuilds(existing)) {
   const active = existing.filter((j) => ACTIVE.has(j.state));
-  if (active.length >= cfg.maxXcode || external > 0) return false;
-  return kind !== 'ios-test' || manualCount(C) + active.filter((j) => j.kind === 'ios-test').length < cfg.maxSimulators;
+  if (external > 0) return false;
+  if (cfg.overlap) {
+    if (kind !== 'ios-test-only' && active.some((j) => j.kind !== 'ios-test-only')) return false;
+    if (simulatorJob(kind) && active.some((j) => simulatorJob(j.kind))) return false;
+  } else if (active.length >= cfg.maxXcode) return false;
+  return !simulatorJob(kind) || manualCount(C) + active.filter((j) => simulatorJob(j.kind)).length < cfg.maxSimulators;
+}
+function dependencyState(job, all) {
+  const dependencies = (job.dependsOn || []).map((id) => all.find((j) => j.id === id));
+  if (dependencies.some((j) => !j || (TERMINAL.has(j.state) && j.state !== 'succeeded'))) return 'failed dependency';
+  return dependencies.some((j) => j.state !== 'succeeded') ? 'dependencies' : null;
+}
+function resourceBusy(job, all) {
+  if (!job.resource) return false;
+  return all.some((other) => {
+    if ((other.resource || other.cwd) !== job.resource || other.id === job.id) return false;
+    if (ACTIVE.has(other.state)) return true;
+    if (!other.pipelineId || other.pipelineId === job.pipelineId || !other.startedAt) return false;
+    return all.some((j) => j.pipelineId === other.pipelineId && !TERMINAL.has(j.state));
+  });
+}
+function waitReason(C, cfg, all, job, external) {
+  return dependencyState(job, all) || (resourceBusy(job, all) ? 'workspace resource' : null) ||
+    (!capacity(C, cfg, all, job.kind, external) ? 'host capacity' : null);
+}
+function chooseJob(C, cfg, all, external) {
+  const eligible = all.filter((j) => j.state === 'queued' && !waitReason(C, cfg, all, j, external));
+  const streak = readJson(path.join(root(C), 'scheduler.json'))?.interactiveStreak || 0;
+  const interactive = eligible.find((j) => j.priority !== 'batch');
+  const batch = eligible.find((j) => j.priority === 'batch');
+  return streak >= 3 ? batch || interactive : interactive || batch;
 }
 function ensureRunner(C) {
   if (lockEntries(C, 'runner').length) return;
@@ -118,36 +149,67 @@ function ensureRunner(C) {
   });
   child.unref();
 }
-async function submit(C, opts, session, deps = {}) {
+function prepareJob(C, opts, session, deps = {}) {
   const cfg = config(C);
   if (!cfg.enabled) throw new Error('testing queue is disabled; configure testing.enabled first');
-  if (!['ios-test', 'build'].includes(opts.kind)) throw new Error('--kind must be ios-test or build');
+  if (!['ios-test', 'ios-test-only', 'build'].includes(opts.kind)) throw new Error('--kind must be ios-test, ios-test-only or build');
+  if (opts.priority && !['interactive', 'batch'].includes(opts.priority)) throw new Error('invalid priority');
+  if (opts.dependsOn !== undefined && (!Array.isArray(opts.dependsOn) || !opts.dependsOn.every((id) => typeof id === 'string'))) throw new Error('invalid dependencies');
   if (!Array.isArray(opts.command) || !opts.command.length || !opts.command.every((s) => typeof s === 'string' && !s.includes('\0'))) throw new Error('provide an argv command after --');
   const cwd = fs.realpathSync(opts.cwd || process.cwd());
   if (!fs.statSync(cwd).isDirectory()) throw new Error('cwd must be a directory');
   if (!deps.allowCommand) validateCommand(opts.command, opts.kind, cwd, cfg);
-  if (opts.kind === 'ios-test') {
+  if (simulatorJob(opts.kind)) {
     const devices = (deps.listDevices || (() => C.listDevices('ios')))();
     if (!devices.some((d) => deviceAllowed(d, cfg, opts))) throw new Error('no compatible allowed agent device; configure an exact device name and runtime');
   }
-  const result = await withLock(C, () => {
     const id = 'test_' + crypto.randomBytes(8).toString('hex');
-    const sequence = Math.max(0, ...jobs(C).map((j) => j.sequence)) + 1;
-    const job = { id, sequence, state: 'queued', kind: opts.kind, command: opts.command, cwd,
+    return { id, state: 'queued', kind: opts.kind, command: opts.command, cwd,
+      priority: opts.priority || 'interactive', dependsOn: opts.dependsOn || [],
+      resource: fs.realpathSync(opts.resource || cwd),
       owner: session.sessionId, ownerName: C.friendlyName(session.sessionId), repo: session.repo,
       runtime: opts.runtime || cfg.runtime, name: opts.name || null, bundleId: opts.bundleId || null,
       submittedAt: Date.now(), log: path.join(root(C), id + '.log') };
-    atomic(file(C, id), job);
+}
+async function submit(C, opts, session, deps = {}) {
+  const job = prepareJob(C, opts, session, deps);
+  const result = await withLock(C, () => {
+    const all = jobs(C);
+    if (job.dependsOn.some((id) => !all.some((j) => j.id === id))) throw new Error('unknown dependency');
+    job.sequence = Math.max(0, ...all.map((j) => j.sequence)) + 1;
+    atomic(file(C, job.id), job);
     return job;
   });
   (deps.ensureRunner || (() => ensureRunner(C)))();
   return result;
 }
+async function submitPipeline(C, plan, session, deps = {}) {
+  if (!plan.resource || !Array.isArray(plan.jobs) || !plan.jobs.length || plan.jobs.length > 500) throw new Error('pipeline requires a resource and 1-500 jobs');
+  const pipelineId = 'pipeline_' + crypto.randomBytes(8).toString('hex');
+  const prepared = [];
+  for (const item of plan.jobs) {
+    if (!Array.isArray(item.dependsOn || []) || (item.dependsOn || []).some((i) => !Number.isInteger(i) || i < 0 || i >= prepared.length)) throw new Error('pipeline dependencies must reference earlier job indexes');
+    const job = prepareJob(C, { ...item, cwd: plan.cwd, resource: plan.resource,
+      dependsOn: (item.dependsOn || []).map((i) => prepared[i].id) }, session, deps);
+    prepared.push({ ...job, pipelineId });
+  }
+  await withLock(C, () => {
+    let sequence = Math.max(0, ...jobs(C).map((j) => j.sequence));
+    for (const job of prepared) { job.sequence = ++sequence; atomic(file(C, job.id), job); }
+    atomic(path.join(root(C), pipelineId + '.json'), { id: pipelineId, jobs: prepared.map((j) => j.id) });
+  });
+  (deps.ensureRunner || (() => ensureRunner(C)))();
+  return { id: pipelineId, jobs: prepared.map((j) => ({ id: j.id, state: j.state })) };
+}
 function status(C, id) {
   const all = jobs(C);
+  const pipeline = typeof id === 'string' && /^pipeline_[a-f0-9]{16}$/.test(id);
   const history = readJson(historyFile(C));
   const waiting = all.filter((j) => j.state === 'queued');
-  const result = all.filter((j) => !id || j.id === id).map((j) => ({ ...j,
+  const cfg = config(C);
+  const external = externalBuilds(all);
+  const result = all.filter((j) => !id || (pipeline ? j.pipelineId === id : j.id === id)).map((j) => ({ ...j,
+    waitReason: j.state === 'queued' ? waitReason(C, cfg, all, j, external) || 'scheduler turn' : null,
     ...(j.state === 'running' && j.phase === 'command' ? { phase: readJson(path.join(root(C), j.id + '.phase.json'))?.phase || j.phase,
       progress: readJson(path.join(root(C), j.id + '.progress.json')) || j.progress || null } : {}),
     estimate: ACTIVE.has(j.state) || j.state === 'queued' ? estimate(j, history) : null,
@@ -156,10 +218,20 @@ function status(C, id) {
     slow: ACTIVE.has(j.state) && Date.now() - j.startedAt > 15 * 60 * 1000,
   }));
   if (id && !result.length) throw new Error('test job not found');
-  return id ? result[0] : result;
+  return id && !pipeline ? result[0] : result;
 }
 async function cancel(C, id, owner) {
   const result = await withLock(C, () => {
+    if (/^pipeline_[a-f0-9]{16}$/.test(id)) {
+      const members = jobs(C).filter((j) => j.pipelineId === id);
+      if (!members.length) throw new Error('pipeline not found');
+      if (members.some((j) => j.owner !== owner)) throw new Error('only the submitting session can cancel this pipeline');
+      for (const job of members.filter((j) => !TERMINAL.has(j.state))) {
+        atomic(path.join(root(C), job.id + '.cancel'), { requestedAt: Date.now() });
+        if (job.state === 'queued') { job.state = 'cancelled'; job.finishedAt = Date.now(); atomic(file(C, job.id), job); }
+      }
+      return members;
+    }
     const job = readJson(file(C, id));
     if (!job) throw new Error('test job not found');
     if (job.owner !== owner) throw new Error('only the submitting session can cancel this job');
@@ -175,6 +247,7 @@ function validateCommand(argv, kind, cwd, cfg) {
   if (path.basename(argv[0]) === 'xcodebuild') {
     if (kind === 'build' && argv.some((s) => ['test', 'test-without-building'].includes(s))) throw new Error('simulator tests require --kind ios-test');
     if (kind === 'build' && argv.some((s) => /platform=iOS Simulator/.test(s) && !/generic\//.test(s))) throw new Error('device destinations require --kind ios-test; use a generic destination for builds');
+    if (kind === 'ios-test-only' && (!argv.includes('test-without-building') || argv.some((s) => ['test', 'build', 'build-for-testing', 'archive', 'clean'].includes(s)))) throw new Error('test-only jobs require test-without-building');
     return;
   }
   const registered = path.basename(argv[0]).startsWith('node') && argv[1] && cfg.runnerScripts.some((s) => path.resolve(cwd, s) === path.resolve(cwd, argv[1]));
@@ -183,7 +256,7 @@ function validateCommand(argv, kind, cwd, cfg) {
 function commandForJob(argv, job, cfg) {
   if (path.basename(argv[0]) !== 'xcodebuild') return argv;
   const controlled = new Set(['-jobs', '-parallel-testing-enabled', '-parallel-testing-worker-count', '-maximum-parallel-testing-workers', '-maximum-concurrent-test-simulator-destinations', '-parallelize-tests-among-destinations']);
-  if (job.kind === 'ios-test') controlled.add('-destination');
+  if (simulatorJob(job.kind)) controlled.add('-destination');
   const result = [argv[0]];
   for (let i = 1; i < argv.length; i++) {
     const flag = argv[i].split('=')[0];
@@ -191,7 +264,7 @@ function commandForJob(argv, job, cfg) {
     if (flag !== '-parallelize-tests-among-destinations' && !argv[i].includes('=')) i++;
   }
   result.push('-jobs', String(cfg.jobs), '-parallel-testing-enabled', 'NO', '-parallel-testing-worker-count', '1', '-maximum-concurrent-test-simulator-destinations', '1');
-  if (job.kind === 'ios-test') result.push('-destination', 'platform=iOS Simulator,id=' + job.device.key);
+  if (simulatorJob(job.kind)) result.push('-destination', 'platform=iOS Simulator,id=' + job.device.key);
   return result;
 }
 // Progress is read from xcodebuild's own output. Every pattern is anchored: simulator apps
@@ -420,7 +493,7 @@ async function work(C, id) {
   }
   if (job?.workerPid !== process.pid) return;
   job.state = 'running';
-  job.phase = job.kind === 'ios-test' ? 'boot' : 'build';
+  job.phase = simulatorJob(job.kind) ? 'boot' : 'build';
   atomic(file(C, id), job);
   const logFd = fs.openSync(job.log, 'a', 0o600);
   let tracker = null;
@@ -451,6 +524,7 @@ async function work(C, id) {
     if (metrics) {
       for (const phase of ['buildMs', 'testMs']) if (Number.isFinite(metrics[phase])) job.timings[phase] = metrics[phase];
       job.reusedBuild = metrics.reusedBuild === true;
+      job.productGeneration = metrics.productGeneration;
       job.tests = metrics.tests;
       job.resultBundle = metrics.result;
     }
@@ -500,12 +574,17 @@ async function tick(C, deps = {}) {
     }
     all = jobs(C);
     if (!config(C).enabled) return;
-    const job = all.find((j) => j.state === 'queued');
-    if (!job || !capacity(C, config(C), all, job.kind, deps.externalBuilds ? deps.externalBuilds() : externalBuilds(all))) return;
+    for (const pending of all.filter((j) => j.state === 'queued')) {
+      if (dependencyState(pending, all) !== 'failed dependency') continue;
+      pending.state = 'blocked'; pending.error = 'dependency failed, cancelled or missing'; pending.finishedAt = Date.now();
+      atomic(file(C, pending.id), pending);
+    }
+    const job = chooseJob(C, config(C), all, deps.externalBuilds ? deps.externalBuilds() : externalBuilds(all));
+    if (!job) return;
     job.state = 'starting'; job.phase = 'starting'; job.startedAt = Date.now();
     job.timings = { queueMs: job.startedAt - job.submittedAt };
     atomic(file(C, job.id), job);
-    if (job.kind === 'ios-test') {
+    if (simulatorJob(job.kind)) {
       const result = C.acquireDevice({ sessionId: job.owner, sessionName: job.ownerName, repo: job.repo, purpose: job.id,
         platform: 'ios', nowMs: Date.now(), bundleId: job.bundleId, prefer: job.name, runtime: job.runtime, queuedJob: job.id }, deps);
       if (!result.ok) {
@@ -518,6 +597,8 @@ async function tick(C, deps = {}) {
       atomic(C.leaseFile('ios', job.device.key), lease);
     }
     atomic(file(C, job.id), job);
+    const scheduler = path.join(root(C), 'scheduler.json');
+    atomic(scheduler, { interactiveStreak: job.priority === 'batch' ? 0 : Math.min(3, (readJson(scheduler)?.interactiveStreak || 0) + 1) });
     const child = (deps.spawn || spawn)(process.execPath, [path.join(__dirname, 'test-queue.js'), 'work', job.id], { detached: true, stdio: 'ignore', env: process.env });
     job.workerPid = child.pid; job.workerBirth = identity(child.pid);
     atomic(file(C, job.id), job);
@@ -557,6 +638,10 @@ async function cli(C, argv) {
     for (const [flag, key] of [['max-xcode', 'maxXcode'], ['max-simulators', 'maxSimulators'], ['jobs', 'jobs']]) {
       if (args[flag] !== undefined) { const n = Number(args[flag]); if (!Number.isInteger(n) || n < 1) throw new Error('invalid --' + flag); testing[key] = n; }
     }
+    if (args.overlap !== undefined) {
+      if (!['true', 'false'].includes(args.overlap)) throw new Error('--overlap must be true or false');
+      testing.overlap = args.overlap === 'true';
+    }
     if (args.runtime) testing.runtime = args.runtime;
     if (args.devices) testing.allowedNames = args.devices.split(',').map((s) => s.trim()).filter(Boolean);
     if (args.protected) testing.protectedDevices = args.protected.split(',').map((s) => s.trim()).filter(Boolean);
@@ -564,7 +649,7 @@ async function cli(C, argv) {
     console.log(JSON.stringify(testing)); return;
   } else if (sub === 'status') {
     const id = args._[2];
-    if (id) file(C, id);
+    if (id && !/^pipeline_[a-f0-9]{16}$/.test(id)) file(C, id);
     result = status(C, id); ensureRunner(C);
   } else if (sub === 'watch') {
     const id = args._[2];
@@ -574,15 +659,19 @@ async function cli(C, argv) {
     return;
   } else {
     const session = C.requireLiveSession(args, Date.now());
+    if (sub === 'pipeline') {
+      result = await submitPipeline(C, JSON.parse(fs.readFileSync(args.file, 'utf8')), session);
+      console.log(JSON.stringify(result)); return;
+    }
     if (sub === 'submit') result = await submit(C, { kind: args.kind, cwd: args.cwd, name: args.name,
-      runtime: args.runtime, bundleId: args['bundle-id'], command: separator < 0 ? [] : argv.slice(separator + 1) }, session);
+      runtime: args.runtime, bundleId: args['bundle-id'], priority: args.priority, resource: args.resource, dependsOn: args['depends-on'] ? args['depends-on'].split(',') : [], command: separator < 0 ? [] : argv.slice(separator + 1) }, session);
     else if (sub === 'cancel') result = await cancel(C, args._[2], session.sessionId);
     else throw new Error('usage: test submit|status|watch|cancel');
   }
   if (args.json) console.log(JSON.stringify(result));
-  else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
+  else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
 }
-module.exports = { emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);
