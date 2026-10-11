@@ -1,17 +1,17 @@
 # aircontrol
 
-Lightweight coordination for **parallel Claude Code and Codex sessions on one machine.**
+Lightweight coordination for **parallel Claude Code, Codex and Grok Build sessions on one machine.**
 
 When you run several coding-agent sessions at once (multiple apps, terminals, worktrees,
 or repos), they can't see each other — two sessions will happily grab the same
 simulator, deploy at the same time, or stomp each other's `git stash`. `aircontrol`
 gives every session a shared view of the room and a way to stake claims and pass notes.
 
-It wires into Claude Code and Codex via **hooks**, so every prompt automatically gets
+It wires into Claude Code, Codex and Grok Build via **hooks**, so every prompt automatically gets
 an `[aircontrol]` context block injected.
 
 - **Zero dependencies** — pure Node standard library.
-- **Cross-agent** — Claude Code and Codex share one roster and message bus.
+- **Cross-agent** — Claude Code, Codex and Grok Build share one roster and message bus.
 - **Machine-local** — state lives under `~/.claude/agents/`; each machine coordinates
   only its own sessions. Nothing leaves your box.
 - **Fail-safe** — hook subcommands swallow every error and exit 0, so AirControl can
@@ -238,6 +238,28 @@ The hook commands name an absolute Node binary — a version-independent path su
 `/opt/homebrew/bin/node` when one exists, otherwise the interpreter that ran the
 installer — so they keep working in shells where `node` isn't on `PATH` (nvm, etc.).
 **After moving your Node install, re-run `node install.js`.**
+
+### Grok
+
+Install [Grok Build](https://x.ai/cli) (`curl -fsSL https://x.ai/cli/install.sh | bash`), then
+re-run `node install.js`. When `~/.grok` (or `$GROK_HOME`) exists, the installer writes
+`~/.grok/hooks/aircontrol.json`. That file wires the same six hooks to the Claude copy of
+`coord.js` with `--harness grok`. Global Grok hooks are always trusted, so there is nothing to
+approve.
+
+What differs from the other two:
+
+- **Roster tag.** Grok sessions show as `[grok]`. Grok sets `GROK_HOOK_EVENT` on every hook,
+  which is how coord.js recognises it.
+- **No double firing.** Grok also runs the hooks in `~/.claude/settings.json` (its Claude
+  compatibility scan). Once `aircontrol.json` is installed, coord.js ignores those copies.
+  Before that, they are the only path in, so a Grok session is still registered and guarded.
+- **Context arrives with the first tool call.** Grok drops `additionalContext` from
+  `UserPromptSubmit`, but it delivers it from `PreToolUse`. So the `[aircontrol]` block, and any
+  messages in it, is handed over by the guard hook on the turn's first tool call. A turn that
+  runs no tool leaves its messages unread, and the Stop hook delivers them instead.
+- **Instructions.** Grok reads `~/.claude/CLAUDE.md`, `AGENTS.md` and Claude skills on its
+  own, so it picks up the protocol section without a Grok-specific copy.
 
 ## The protocol
 

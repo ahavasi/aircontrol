@@ -278,17 +278,22 @@ function toolInputPaths(input) {
 
 // ---------- harness identity ----------
 //
-// Both harnesses speak the same hook JSON, so almost nothing here branches on which one is
+// Every harness speaks the same hook JSON, so almost nothing here branches on which one is
 // running. What does differ is *where its coord.js copy lives* (the footer the model is told
 // to run) and where its transcript is. Codex exposes no session-id or harness env var, so
 // the installer declares it (`--harness codex` on every Codex hook command) and, for older
 // hooks.json files that predate the flag, the rollout path in `transcript_path` gives it away.
-const HARNESSES = new Set(['claude', 'codex']);
+// Grok Build sets GROK_HOOK_EVENT on every hook it runs, including the Claude hooks it picks
+// up from ~/.claude/settings.json, so the env outranks a `claude` an earlier hook recorded.
+const HARNESSES = new Set(['claude', 'codex', 'grok']);
 
 function codexHome() { return process.env.CODEX_HOME || path.join(os.homedir(), '.codex'); }
+function grokHome() { return process.env.GROK_HOME || path.join(os.homedir(), '.grok'); }
+function grokHookFile() { return path.join(grokHome(), 'hooks', 'aircontrol.json'); }
 
 function detectHarness(input, explicit, prev) {
   if (explicit && HARNESSES.has(explicit)) return explicit;
+  if (process.env.GROK_HOOK_EVENT) return 'grok';
   if (prev && prev.harness && HARNESSES.has(prev.harness)) return prev.harness;
   const tp = input && typeof input.transcript_path === 'string' ? input.transcript_path : '';
   if (tp && (tp.startsWith(path.join(codexHome(), 'sessions') + path.sep) || /[\\/]\.codex[\\/]sessions[\\/]/.test(tp))) return 'codex';
@@ -1511,7 +1516,7 @@ function recordDenial(id, result, input, nowMs) {
   } catch {}
 }
 
-function cmdGuard(input, nowMs) {
+function cmdGuard(input, nowMs, harness) {
   let result;
   try {
     result = computeGuardDecision(input, nowMs);
@@ -1526,7 +1531,7 @@ function cmdGuard(input, nowMs) {
     } catch {}
     return;
   }
-  if (!result || !result.deny) return;
+  if (!result || !result.deny) return flushPendingContext(input, harness);
   recordDenial(input.session_id, result, input, nowMs);
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
@@ -1535,6 +1540,29 @@ function cmdGuard(input, nowMs) {
       permissionDecisionReason: result.reason,
     },
   }) + '\n');
+}
+
+// Grok Build drops `additionalContext` from UserPromptSubmit and SessionStart but delivers it
+// from PreToolUse, so cmdInject parks a Grok session's block and the first tool call of the
+// turn hands it over. The inbox files ride along and are only marked read here: a turn that
+// runs no tool leaves them unread for cmdStop instead of losing them.
+function flushPendingContext(input, harness) {
+  const id = input && input.session_id;
+  if (!isSafeComponent(id)) return;
+  const s = readSession(id);
+  if (!s || !s.pendingContext || detectHarness(input, harness, s) !== 'grok') return;
+  let parked = null;
+  updateSession(id, (cur) => {
+    parked = { context: cur.pendingContext, inbox: cur.pendingInbox || [] };
+    delete cur.pendingContext;
+    delete cur.pendingInbox;
+    return cur;
+  });
+  if (!parked || !parked.context) return;
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: parked.context },
+  }) + '\n');
+  for (const f of parked.inbox) { try { fs.renameSync(f, f + '.read'); } catch {} }
 }
 
 // ---------- inject (hook) ----------
@@ -1576,7 +1604,8 @@ function cmdInject(input, nowMs, harness) {
   if (!s) return;
   const others = [...readSessions().filter((o) => o.sessionId !== id && !isExpired(o, nowMs)), ...relayRosterSessions(s, nowMs)];
   const inbox = readInbox(id);
-  const cliPath = cliPathFor(detectHarness(input, harness, s));
+  const resolvedHarness = detectHarness(input, harness, s);
+  const cliPath = cliPathFor(resolvedHarness);
   let ledgerLine = '';
   if (ledgerPending) {
     try {
@@ -1598,7 +1627,12 @@ function cmdInject(input, nowMs, harness) {
     if (Q.config(module.exports).enabled) testsLine = Q.renderTestsLine(Q.status(module.exports), id, nowMs);
   } catch { testsLine = ''; }
   const context = [renderInjection(s, others, inbox, nowMs, cliPath, ledgerLine, budgetLine, diskLine, testsLine), cloudLine].filter(Boolean).join('\n');
-  // Both harnesses take the same shape, and it is the quiet one. `additionalContext`
+  if (resolvedHarness === 'grok') {
+    const files = inbox.map((m) => m.file);
+    updateSession(id, (cur) => { cur.pendingContext = context; cur.pendingInbox = files; return cur; });
+    return;
+  }
+  // Claude and Codex take the same shape, and it is the quiet one. `additionalContext`
   // reaches the model without echoing the roster into the operator's terminal; bare stdout
   // is *printed as well as* injected, which put a block of coordination state in front of
   // the human on every single prompt. The harness only picks the CLI path in the footer.
@@ -1668,6 +1702,9 @@ function cmdStop(input, nowMs, harness, deps = {}) {
   if (!isSafeComponent(id)) return;
   let s = readSession(id);
   if (!s) return; // unregistered: nothing addressed us, nothing to deliver
+  // A block nobody's tool call collected is stale by the next turn, and this Stop is about to
+  // deliver its messages itself.
+  if (s.pendingContext) s = updateSession(id, (cur) => { delete cur.pendingContext; delete cur.pendingInbox; return cur; }) || s;
   if (isCloudRuntime()) {
     // Idle is what tells a sender to wake this session with a follow-up, since
     // an idle cloud session runs no hooks until something prompts it.
@@ -5048,10 +5085,13 @@ function main() {
       // `--harness codex` is what the installer puts on every Codex hook command; the
       // `inject-codex` spelling is the pre-flag form and means the same thing.
       const harness = cmd === 'inject-codex' ? 'codex' : parseArgs(process.argv.slice(3)).harness;
+      // Grok also runs every hook in ~/.claude/settings.json. Once its own hook file is
+      // installed, those copies would register, guard and deliver a second time.
+      if (process.env.GROK_HOOK_EVENT && harness !== 'grok' && fs.existsSync(grokHookFile())) { process.exitCode = 0; return; }
       if (cmd === 'register') cmdRegister(input, nowMs, harness);
       else if (cmd === 'inject' || cmd === 'inject-codex') cmdInject(input, nowMs, harness);
       else if (cmd === 'beat') cmdBeat(input, nowMs, harness);
-      else if (cmd === 'guard') cmdGuard(input, nowMs);
+      else if (cmd === 'guard') cmdGuard(input, nowMs, harness);
       else if (cmd === 'nudge') cmdStop(input, nowMs, harness);
       else cmdDeregister(input, nowMs, { live: true });
       if (['register', 'inject', 'inject-codex', 'beat'].includes(cmd)) {
@@ -5131,7 +5171,7 @@ module.exports = {
   boundaryPrefix, pathsOverlap, isStale, isExpired, holdsClaims, mergeClaims, resolveIdPrefix, isSafeComponent,
   requireLiveSession,
   messageFilename, shortId, agoLabel, splitList, toolInputPaths, parseArgs, advisories,
-  HARNESSES, codexHome, detectHarness, cliPathFor, harnessTag,
+  HARNESSES, codexHome, grokHome, grokHookFile, detectHarness, cliPathFor, harnessTag, flushPendingContext,
   SKILL_TARGET_DIRS, listSkillDirs, skillLinkPlan, skillUnlinkPlan, applySkillPlan, codexLegacySkillDuplicates,
   skillsConfig, autoLinkSkills, cmdSkills,
   renderInjection, renderMessageLines, claimSummary,

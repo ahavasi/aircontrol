@@ -1,11 +1,12 @@
 {
   "name": "aircontrol",
   "version": "1.3.0",
-  "description": "Coordination for parallel Claude Code and Codex sessions, local and in the cloud: roster, claims, advisories, and messaging.",
+  "description": "Coordination for parallel Claude Code, Codex and Grok Build sessions, local and in the cloud: roster, claims, advisories, and messaging.",
   "keywords": [
     "claude",
     "claude-code",
     "codex",
+    "grok",
     "hooks",
     "coordination",
     "agents"

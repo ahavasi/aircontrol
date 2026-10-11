@@ -680,6 +680,104 @@ test('hook dispatch honours --harness and keeps inject-codex as an alias', () =>
   assert.match(plain.hookSpecificOutput.additionalContext, /Coordination CLI: node ~\/\.claude\/hooks\/coord\.js/);
 });
 
+// ---------- Grok Build ----------
+//
+// Payload shapes below are trimmed from live grok 1.0.50 captures: every event carries both
+// the camelCase fields and Claude's snake_case aliases, and the tools reach hooks under
+// their native names.
+
+function grokPayload(event, sessionId, cwd, extra = {}) {
+  return {
+    hookEventName: event, sessionId, cwd, workspaceRoot: cwd, permissionMode: 'default',
+    hook_event_name: event, session_id: sessionId, permission_mode: 'default', ...extra,
+  };
+}
+
+function withGrokEnv(fn) {
+  const prev = process.env.GROK_HOOK_EVENT;
+  process.env.GROK_HOOK_EVENT = 'pre_tool_use';
+  try { return fn(); } finally { if (prev === undefined) delete process.env.GROK_HOOK_EVENT; else process.env.GROK_HOOK_EVENT = prev; }
+}
+
+test('detectHarness: GROK_HOOK_EVENT marks grok even over a stored claude, but not over an explicit flag', () => {
+  withGrokEnv(() => {
+    assert.equal(C.detectHarness({}), 'grok');
+    assert.equal(C.detectHarness({}, undefined, { harness: 'claude' }), 'grok', 'a compat-fired register must not pin it as claude');
+    assert.equal(C.detectHarness({}, 'codex'), 'codex');
+  });
+  assert.equal(C.detectHarness({}, 'grok'), 'grok');
+  assert.equal(C.harnessTag({ harness: 'grok' }), ' [grok]');
+});
+
+test('guard denies a Grok write tool on a path another live session claims', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('grok-guard');
+  const now = Date.now();
+  C.cmdRegister(grokPayload('SessionStart', 'grok-g-1', repo), now, 'grok');
+  C.cmdRegister({ session_id: 'bbbb-g-1', cwd: repo }, now);
+  captureStdout(() => C.cmdClaim({ session: 'bbbb-g', intent: 'store rework', paths: 'Store' }, now));
+  for (const tool of ['write', 'search_replace']) {
+    const input = grokPayload('PreToolUse', 'grok-g-1', repo, {
+      toolName: tool, toolInput: { file_path: path.join(repo, 'Store', 'a.swift') },
+      tool_name: tool, tool_input: { file_path: path.join(repo, 'Store', 'a.swift') },
+    });
+    const out = JSON.parse(captureStdout(() => C.cmdGuard(input, now, 'grok')));
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny', tool);
+  }
+});
+
+test('Grok inject parks the block until the first tool call, which delivers it and marks messages read', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('grok-inject');
+  const now = Date.now();
+  C.cmdRegister({ session_id: 'peer-gi-1', cwd: repo }, now);
+  C.cmdRegister(grokPayload('SessionStart', 'grok-i-1', repo), now, 'grok');
+  C.cmdSend({ _: ['send', 'hello grok'], session: 'peer-gi', to: 'grok-i' }, now);
+  const injected = captureStdout(() => C.cmdInject(grokPayload('UserPromptSubmit', 'grok-i-1', repo, { prompt: 'hi' }), now, 'grok'));
+  assert.equal(injected, '', 'Grok drops UserPromptSubmit context, so nothing is printed there');
+  assert.equal(C.readInbox('grok-i-1').length, 1, 'still unread: nobody has seen it yet');
+
+  const shell = grokPayload('PreToolUse', 'grok-i-1', repo, {
+    toolName: 'run_terminal_command', toolInput: { command: 'ls' }, tool_name: 'run_terminal_command', tool_input: { command: 'ls' },
+  });
+  const out = JSON.parse(captureStdout(() => C.cmdGuard(shell, now, 'grok')));
+  assert.equal(out.hookSpecificOutput.hookEventName, 'PreToolUse');
+  assert.equal(out.hookSpecificOutput.permissionDecision, undefined, 'context only, no decision');
+  assert.match(out.hookSpecificOutput.additionalContext, /hello grok/);
+  assert.match(out.hookSpecificOutput.additionalContext, /Coordination CLI: node ~\/\.claude\/hooks\/coord\.js/);
+  assert.equal(C.readInbox('grok-i-1').length, 0);
+  assert.equal(captureStdout(() => C.cmdGuard(shell, now, 'grok')), '', 'delivered once');
+});
+
+test('Grok turn with no tool call leaves messages for Stop and drops the stale block', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('grok-stop');
+  const now = Date.now();
+  C.cmdRegister({ session_id: 'peer-gs-1', cwd: repo }, now);
+  C.cmdRegister(grokPayload('SessionStart', 'grok-s-1', repo), now, 'grok');
+  C.cmdSend({ _: ['send', 'answer me'], session: 'peer-gs', to: 'grok-s' }, now);
+  captureStdout(() => C.cmdInject(grokPayload('UserPromptSubmit', 'grok-s-1', repo), now, 'grok'));
+  const stop = JSON.parse(captureStdout(() => C.cmdStop(grokPayload('Stop', 'grok-s-1', repo, { stopHookActive: false, stop_hook_active: false }), now, 'grok')));
+  assert.match(stop.reason, /answer me/);
+  assert.equal(C.readSession('grok-s-1').pendingContext, undefined);
+});
+
+test('hook dispatch ignores Grok compat copies of the Claude hooks once its own hook file exists', () => {
+  const dir = freshDataDir();
+  const repo = tmpGitRepo('grok-compat');
+  const grokHome = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-home-'));
+  const env = { ...process.env, AIRCONTROL_DIR: dir, GROK_HOME: grokHome, GROK_HOOK_EVENT: 'session_start' };
+  const run = (args, input) => execFileSync(process.execPath, [path.join(__dirname, 'coord.js'), ...args], { input: JSON.stringify(input), env, encoding: 'utf8' });
+  run(['register'], grokPayload('SessionStart', 'grok-c-1', repo));
+  assert.equal(C.readSession('grok-c-1').harness, 'grok', 'without the file, compat is the only path in');
+  fs.mkdirSync(path.join(grokHome, 'hooks'));
+  fs.writeFileSync(path.join(grokHome, 'hooks', 'aircontrol.json'), '{}');
+  run(['register'], grokPayload('SessionStart', 'grok-c-2', repo));
+  assert.equal(C.readSession('grok-c-2'), null);
+  run(['register', '--harness', 'grok'], grokPayload('SessionStart', 'grok-c-3', repo));
+  assert.equal(C.readSession('grok-c-3').harness, 'grok');
+});
+
 // ---------- skills bridge ----------
 //
 // Claude Code reads `.claude/skills`; Codex, Gemini CLI, opencode, Cursor, Kimi and Copilot
