@@ -5129,6 +5129,9 @@ function main() {
     else if (cmd === 'test') {
       require('./test-queue.js').cli(module.exports, process.argv.slice(2)).catch((e) => { console.error(`aircontrol error: ${e.message}`); process.exitCode = 1; });
     }
+    else if (cmd === 'dashboard') {
+      require('./dashboard.js').cli(module.exports, args).catch((e) => { console.error(`aircontrol error: ${e.message}`); process.exitCode = 1; });
+    }
     else if (cmd === 'ledger') cmdLedger(args, nowMs);
     else if (cmd === 'handoff') cmdHandoff(args, nowMs);
     else if (cmd === 'sync') cmdSync(args, nowMs);
@@ -5150,10 +5153,12 @@ function main() {
       require(installer).main(process.argv.slice(2));
     }
     else {
-      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|ledger|handoff|cloud|relay|worktrees|disk|browsers|tasks|retro|log|skills|peek> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
+      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|ledger|handoff|cloud|relay|worktrees|disk|browsers|tasks|retro|log|skills|peek|test|dashboard> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
       console.error('       coord.js skills <status|link|unlink> [--repo path|--global] [--targets agents,grok] [--dry-run] [--json] — mirror .claude/skills into the dirs other harnesses read');
       console.error('       coord.js sim <list|acquire|release> [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
       console.error('       coord.js ledger <add|list|show|take|note|block|unblock|done|drop> [--repo .|all|path] [--title "…"] [--points-at ref] [--status …] [--priority low|normal|high|urgent] [--depends-on id1,id2] [--mine] [--notes] — list omits notes; show <id> prints them');
+      console.error('       coord.js test <submit|status|list|line|watch|cancel> [--json] — list shows the whole queue; line --session <name> prints the status-line segment');
+      console.error('       coord.js dashboard [--port 7788] [--open] — local live view (a cmux browser split when run inside cmux) of the queue, verify runs and simulators');
       console.error('       coord.js handoff --session <me> --to <them> [--ledger-id id] [--note "context for the recipient"]');
       console.error('       machine-readable: who [--assignable] --json · ledger list --json · sim list --json');
       console.error('       coord.js peek <file> [--keys] [--grep pattern] — print a config or env file with its secrets masked');

@@ -358,3 +358,40 @@ test('no ETA once the command has finished and the job is cleaning up', () => {
     timings: { commandMs: 160000 }, estimate: { commandMs: 160000, ui: 0, unit: 1185 }, progress: { ui: { passed: 0, failed: 0 }, unit: { done: 0, failed: 0, total: 1185, result: 'passed' } } };
   assert.equal(Q.formatProgress(j, 200000), '1185 unit ✓');
 });
+test('snapshot lists active, queued and recent jobs, groups verify runs and joins device leases', () => {
+  setup();
+  const now = Date.now();
+  const stage = (chunk) => ['node', 'verify.mjs', '--run-stage', chunk === 'build' ? 'build' : 'test', '--pipeline', '/p/verify_abc.json', ...(chunk === 'build' ? [] : ['--chunk', chunk])];
+  const write = (o) => Q.atomic(Q.file(C, o.id), { kind: 'ios-test-only', cwd: '/w/app-feature', owner: 'o', ownerName: 'owner-name', submittedAt: now - 60000, ...o });
+  fs.mkdirSync(Q.root(C), { recursive: true });
+  Q.atomic(path.join(Q.root(C), 'pipeline_00000000000000aa.json'), { id: 'pipeline_00000000000000aa', jobs: [] });
+  write({ id: 'test_00000000000000a1', sequence: 1, state: 'succeeded', kind: 'build', command: stage('build'), pipelineId: 'pipeline_00000000000000aa', startedAt: now - 50000, finishedAt: now - 40000 });
+  write({ id: 'test_00000000000000a2', sequence: 2, state: 'running', phase: 'test', command: stage('HomeUITests'), pipelineId: 'pipeline_00000000000000aa', startedAt: now - 30000, device });
+  write({ id: 'test_00000000000000a3', sequence: 3, state: 'queued', command: stage('ScanUITests'), pipelineId: 'pipeline_00000000000000aa' });
+  write({ id: 'test_00000000000000a4', sequence: 4, state: 'failed', kind: 'build', command: ['xcodebuild', 'build'], startedAt: now - 3 * 3600000, finishedAt: now - 2 * 3600000 });
+  const snap = Q.snapshot(C, { now, devices: [device, { ...device, name: 'Someone iPhone', key: 'OTHER' }], readLeases: () => [{ platform: 'ios', key: device.key, sessionName: 'owner-name', jobId: 'test_00000000000000a2' }] });
+  assert.deepEqual(snap.jobs.map((j) => [j.label, j.state]), [['HomeUITests', 'running'], ['ScanUITests', 'queued'], ['build', 'succeeded']]);
+  assert.equal(snap.jobs[1].queuePosition, 1);
+  assert.equal(snap.jobs[0].worktree, 'app-feature');
+  assert.deepEqual(snap.pipelines.map((p) => [p.name, p.state, p.jobs.length]), [['verify_abc', 'running', 3]]);
+  assert.deepEqual(snap.devices, [{ name: 'Aircontrol-Agent', key: device.key, runtime: 'iOS 26.5', state: 'shutdown', holder: 'owner-name', jobId: 'test_00000000000000a2', purpose: null }]);
+  assert.match(Q.renderList(snap), /test_00000000000000a3 queued +#1 .*ScanUITests/);
+});
+test('status-line segment shows own jobs, counts others, and hides when idle or stale', () => {
+  const now = 10_000_000;
+  const summary = { at: now, simsBusy: 1, simsMax: 1, jobs: [
+    { ownerName: 'me', active: true, text: 'build building 2:14 ~3m' }, { ownerName: 'peer', active: false, text: 'x #1' }, { ownerName: 'me', active: false, text: 'HomeUITests #2' }] };
+  assert.equal(Q.renderStatusSegment(summary, 'me', now), '🧪 build building 2:14 ~3m · HomeUITests #2 · 1 other · sims 1/1');
+  assert.equal(Q.renderStatusSegment({ ...summary, jobs: [] }, 'me', now), '');
+  assert.equal(Q.renderStatusSegment(summary, 'me', now + 3 * 60000), '');
+  assert.equal(Q.renderStatusSegment(null, 'me', now), '');
+});
+test('dispatcher writes the status-line cache and clears it when the queue drains', async () => {
+  setup();
+  const session = { sessionId: 'queue-owner' };
+  await Q.submit(C, options(), session, noRunner);
+  await Q.dispatch(C, deps);
+  const cache = JSON.parse(fs.readFileSync(Q.statuslineFile(C), 'utf8'));
+  assert.deepEqual(cache.jobs, []);
+  assert.ok(Date.now() - cache.at < 60000);
+});
