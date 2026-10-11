@@ -77,6 +77,7 @@ function copyRuntime(target) {
   fs.copyFileSync(path.join(__dirname, 'test-queue.js'), path.join(path.dirname(target), 'test-queue.js'));
   fs.copyFileSync(source, target);
   fs.copyFileSync(path.join(__dirname, 'codex-listener.js'), path.join(path.dirname(target), 'codex-listener.js'));
+  fs.copyFileSync(path.join(__dirname, 'dashboard.js'), path.join(path.dirname(target), 'dashboard.js'));
   fs.cpSync(path.dirname(require.resolve('ws/package.json')), path.join(path.dirname(target), 'node_modules', 'ws'), { recursive: true });
   console.log(`copied coord.js -> ${target}`);
 }
@@ -813,7 +814,7 @@ function uninstallHooks(file) {
 
 function removeRuntime(target) {
   const dir = path.dirname(target);
-  for (const f of [target, path.join(dir, 'codex-listener.js'), path.join(dir, 'test-queue.js')]) fs.rmSync(f, { force: true });
+  for (const f of [target, path.join(dir, 'codex-listener.js'), path.join(dir, 'test-queue.js'), path.join(dir, 'dashboard.js')]) fs.rmSync(f, { force: true });
   fs.rmSync(path.join(dir, 'node_modules', 'ws'), { recursive: true, force: true });
   try { fs.rmdirSync(path.join(dir, 'node_modules')); } catch {}
 }

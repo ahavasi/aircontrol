@@ -618,8 +618,10 @@ async function dispatch(C, deps = {}) {
   try {
     while (true) {
       try { await tick(C, deps); } catch (e) { if (e.code !== 'AIRCONTROL_QUEUE_BUSY') throw e; }
+      writeStatusline(C);
       const pending = jobs(C).some((j) => j.state === 'queued' || ACTIVE.has(j.state));
       if (!pending) {
+        writeStatusline(C);
         release();
         // A submit racing the idle transition must not leave a job without a runner.
         if (jobs(C).some((j) => j.state === 'queued')) ensureRunner(C);
@@ -628,6 +630,96 @@ async function dispatch(C, deps = {}) {
       await delay(2000);
     }
   } finally { release(); }
+}
+const RECENT_MS = 30 * 60 * 1000;
+const STALE_STATUSLINE_MS = 2 * 60 * 1000;
+const statuslineFile = (C) => path.join(root(C), 'statusline.json');
+function jobLabel(j) {
+  const argv = (j.command || []).map(String);
+  const flag = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; };
+  if (flag('--chunk')) return flag('--chunk');
+  if (flag('--run-stage') === 'build') return 'build';
+  const only = argv.filter((s) => s.startsWith('-only-testing:')).map((s) => s.slice(14).split('/').pop());
+  if (only.length) return only.length === 1 ? only[0] : `${only[0]} +${only.length - 1}`;
+  if (j.kind === 'build') return 'build';
+  if (argv.some((s) => /test/.test(String(s)))) return j.kind === 'ios-test-only' ? 'tests' : 'build + tests';
+  return j.kind;
+}
+function verifyGroup(j) {
+  const argv = (j.command || []).map(String);
+  const i = argv.indexOf('--pipeline');
+  return i >= 0 ? path.basename(argv[i + 1] || '', '.json') : null;
+}
+const rank = (j) => (ACTIVE.has(j.state) ? 0 : j.state === 'queued' ? 1 : 2);
+function shortPhase(j) {
+  if (j.state === 'queued') return `#${j.queuePosition}`;
+  return { starting: 'starting', boot: 'booting', build: 'building', command: 'running', test: 'testing', cleanup: 'cleanup' }[j.phase] || j.phase || j.state;
+}
+function viewJob(j, now) {
+  return {
+    id: j.id, label: jobLabel(j), pipelineId: j.pipelineId || null, ownerName: j.ownerName, kind: j.kind, state: j.state,
+    phase: j.phase || null, phaseLabel: j.state === 'queued' ? 'queued' : TERMINAL.has(j.state) ? j.state : phaseLabel(j.phase || j.state),
+    priority: j.priority, group: verifyGroup(j),
+    queuePosition: j.queuePosition, waitReason: j.waitReason, worktree: j.cwd ? path.basename(j.cwd) : null,
+    device: j.device ? { name: j.device.name, key: j.device.key } : null, submittedAt: j.submittedAt, startedAt: j.startedAt || null,
+    commandStartedAt: j.commandStartedAt || null, finishedAt: j.finishedAt || null, elapsedMs: j.elapsedMs, slow: !!j.slow,
+    estimateMs: j.estimate?.commandMs ?? null, remainingMs: remainingMs(j, now), progress: j.progress || null,
+    progressText: formatProgress(j, now), timings: j.timings || null, error: j.error || null, tests: j.tests ?? null,
+  };
+}
+function snapshot(C, deps = {}) {
+  const now = deps.now || Date.now();
+  const cfg = config(C);
+  const all = status(C).filter((j) => !TERMINAL.has(j.state) || now - (j.finishedAt || 0) < RECENT_MS)
+    .sort((a, b) => rank(a) - rank(b) || (rank(a) === 2 ? (b.finishedAt || 0) - (a.finishedAt || 0) : a.sequence - b.sequence)).map((j) => viewJob(j, now));
+  const pipelines = [];
+  for (const j of all.filter((x) => x.pipelineId)) {
+    let p = pipelines.find((x) => x.id === j.pipelineId);
+    if (!p) pipelines.push(p = { id: j.pipelineId, name: j.group || j.pipelineId, ownerName: j.ownerName, worktree: j.worktree, jobs: [] });
+    p.jobs.push(j.id);
+  }
+  for (const p of pipelines) {
+    const members = all.filter((j) => j.pipelineId === p.id);
+    p.state = members.some((j) => ACTIVE.has(j.state)) ? 'running' : members.some((j) => j.state === 'queued') ? 'queued'
+      : members.every((j) => j.state === 'succeeded') ? 'succeeded' : 'failed';
+  }
+  const leases = (deps.readLeases || C.readLeases)().filter((l) => l.platform === 'ios');
+  const listed = deps.devices || (deps.listDevices || C.listDevices)('ios', deps);
+  const devices = listed.filter((d) => deviceAllowed(d, cfg) || leases.some((l) => l.key === d.key)).map((d) => {
+    const lease = leases.find((l) => l.key === d.key);
+    return { name: d.name, key: d.key, runtime: d.runtime, state: d.state, holder: lease ? lease.sessionName || C.friendlyName(lease.sessionId) : null,
+      jobId: lease?.jobId || null, purpose: lease?.purpose || null };
+  });
+  return { at: now, config: { enabled: cfg.enabled, overlap: cfg.overlap, maxXcode: cfg.maxXcode, maxSimulators: cfg.maxSimulators }, jobs: all, pipelines, devices };
+}
+// The status line redraws every second; it reads this file instead of spawning node.
+function statuslineSummary(C, all, now = Date.now()) {
+  const shown = all.filter((j) => j.state === 'queued' || ACTIVE.has(j.state));
+  const leases = C.readLeases().filter((l) => l.platform === 'ios').length;
+  return { at: now, simsBusy: leases, simsMax: config(C).maxSimulators, jobs: shown.map((j) => {
+    const clock = ACTIVE.has(j.state) && j.startedAt ? ' ' + formatClock(now - j.startedAt) : '';
+    const left = remainingMs(j, now);
+    const eta = left > 0 ? ` ~${formatDuration(left)}` : '';
+    return { ownerName: j.ownerName, active: ACTIVE.has(j.state), text: `${jobLabel(j)} ${shortPhase(j)}${clock}${eta}` };
+  }) };
+}
+function writeStatusline(C, now = Date.now()) {
+  try { atomic(statuslineFile(C), statuslineSummary(C, status(C), now)); } catch {}
+}
+function renderStatusSegment(summary, ownerName, now = Date.now()) {
+  if (!summary || now - summary.at > STALE_STATUSLINE_MS || !summary.jobs.length) return '';
+  const mine = summary.jobs.filter((j) => j.ownerName === ownerName);
+  const others = summary.jobs.length - mine.length;
+  const parts = mine.slice(0, 2).map((j) => j.text);
+  if (mine.length > 2) parts.push(`+${mine.length - 2} more`);
+  if (others) parts.push(`${others} other${others === 1 ? '' : 's'}`);
+  parts.push(`sims ${summary.simsBusy}/${summary.simsMax}`);
+  return '🧪 ' + parts.join(' · ');
+}
+function renderList(snap) {
+  if (!snap.jobs.length) return 'queue empty';
+  return snap.jobs.map((j) => [j.id, j.state.padEnd(9), (j.state === 'queued' ? '#' + j.queuePosition : j.phaseLabel).padEnd(18),
+    j.ownerName.padEnd(22), j.label.padEnd(28), j.worktree || '-', j.progressText ? '· ' + j.progressText : ''].join(' ')).join('\n');
 }
 async function cli(C, argv) {
   const separator = argv.indexOf('--');
@@ -657,6 +749,12 @@ async function cli(C, argv) {
     const id = args._[2];
     if (id && !/^pipeline_[a-f0-9]{16}$/.test(id)) file(C, id);
     result = status(C, id); ensureRunner(C);
+  } else if (sub === 'list') {
+    const snap = snapshot(C); ensureRunner(C);
+    console.log(args.json ? JSON.stringify(snap) : renderList(snap)); return;
+  } else if (sub === 'line') {
+    const line = renderStatusSegment(statuslineSummary(C, status(C)), args.session);
+    if (line) console.log(line); return;
   } else if (sub === 'watch') {
     const id = args._[2];
     if (!id) throw new Error('usage: test watch <job-id> [--quiet]');
@@ -672,12 +770,12 @@ async function cli(C, argv) {
     if (sub === 'submit') result = await submit(C, { kind: args.kind, cwd: args.cwd, name: args.name,
       runtime: args.runtime, bundleId: args['bundle-id'], priority: args.priority, resource: args.resource, dependsOn: args['depends-on'] ? args['depends-on'].split(',') : [], command: separator < 0 ? [] : argv.slice(separator + 1) }, session);
     else if (sub === 'cancel') result = await cancel(C, args._[2], session.sessionId);
-    else throw new Error('usage: test submit|status|watch|cancel');
+    else throw new Error('usage: test submit|status|list|line|watch|cancel');
   }
   if (args.json) console.log(JSON.stringify(result));
   else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
 }
-module.exports = { emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);
