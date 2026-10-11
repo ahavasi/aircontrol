@@ -290,10 +290,16 @@ const HARNESSES = new Set(['claude', 'codex', 'grok']);
 function codexHome() { return process.env.CODEX_HOME || path.join(os.homedir(), '.codex'); }
 function grokHome() { return process.env.GROK_HOME || path.join(os.homedir(), '.grok'); }
 function grokHookFile() { return path.join(grokHome(), 'hooks', 'aircontrol.json'); }
+// The env var alone is not proof: it can leak into a child process, and a Claude session that
+// inherited it would have its guard switched off below. Grok's payload also carries the
+// camelCase `hookEventName`, which Claude never sends.
+function isGrokHook(input) {
+  return Boolean(process.env.GROK_HOOK_EVENT) && Boolean(input) && typeof input.hookEventName === 'string';
+}
 
 function detectHarness(input, explicit, prev) {
   if (explicit && HARNESSES.has(explicit)) return explicit;
-  if (process.env.GROK_HOOK_EVENT) return 'grok';
+  if (isGrokHook(input)) return 'grok';
   if (prev && prev.harness && HARNESSES.has(prev.harness)) return prev.harness;
   const tp = input && typeof input.transcript_path === 'string' ? input.transcript_path : '';
   if (tp && (tp.startsWith(path.join(codexHome(), 'sessions') + path.sep) || /[\\/]\.codex[\\/]sessions[\\/]/.test(tp))) return 'codex';
@@ -5087,7 +5093,7 @@ function main() {
       const harness = cmd === 'inject-codex' ? 'codex' : parseArgs(process.argv.slice(3)).harness;
       // Grok also runs every hook in ~/.claude/settings.json. Once its own hook file is
       // installed, those copies would register, guard and deliver a second time.
-      if (process.env.GROK_HOOK_EVENT && harness !== 'grok' && fs.existsSync(grokHookFile())) { process.exitCode = 0; return; }
+      if (isGrokHook(input) && harness !== 'grok' && fs.existsSync(grokHookFile())) { process.exitCode = 0; return; }
       if (cmd === 'register') cmdRegister(input, nowMs, harness);
       else if (cmd === 'inject' || cmd === 'inject-codex') cmdInject(input, nowMs, harness);
       else if (cmd === 'beat') cmdBeat(input, nowMs, harness);
@@ -5171,7 +5177,7 @@ module.exports = {
   boundaryPrefix, pathsOverlap, isStale, isExpired, holdsClaims, mergeClaims, resolveIdPrefix, isSafeComponent,
   requireLiveSession,
   messageFilename, shortId, agoLabel, splitList, toolInputPaths, parseArgs, advisories,
-  HARNESSES, codexHome, grokHome, grokHookFile, detectHarness, cliPathFor, harnessTag, flushPendingContext,
+  HARNESSES, codexHome, grokHome, grokHookFile, isGrokHook, detectHarness, cliPathFor, harnessTag, flushPendingContext,
   SKILL_TARGET_DIRS, listSkillDirs, skillLinkPlan, skillUnlinkPlan, applySkillPlan, codexLegacySkillDuplicates,
   skillsConfig, autoLinkSkills, cmdSkills,
   renderInjection, renderMessageLines, claimSummary,

@@ -701,9 +701,11 @@ function withGrokEnv(fn) {
 
 test('detectHarness: GROK_HOOK_EVENT marks grok even over a stored claude, but not over an explicit flag', () => {
   withGrokEnv(() => {
-    assert.equal(C.detectHarness({}), 'grok');
-    assert.equal(C.detectHarness({}, undefined, { harness: 'claude' }), 'grok', 'a compat-fired register must not pin it as claude');
-    assert.equal(C.detectHarness({}, 'codex'), 'codex');
+    const grok = { hookEventName: 'pre_tool_use' };
+    assert.equal(C.detectHarness(grok), 'grok');
+    assert.equal(C.detectHarness(grok, undefined, { harness: 'claude' }), 'grok', 'a compat-fired register must not pin it as claude');
+    assert.equal(C.detectHarness(grok, 'codex'), 'codex');
+    assert.equal(C.detectHarness({ hook_event_name: 'PreToolUse' }), 'claude', 'a leaked env var on a Claude payload is not Grok');
   });
   assert.equal(C.detectHarness({}, 'grok'), 'grok');
   assert.equal(C.harnessTag({ harness: 'grok' }), ' [grok]');
@@ -776,6 +778,8 @@ test('hook dispatch ignores Grok compat copies of the Claude hooks once its own 
   assert.equal(C.readSession('grok-c-2'), null);
   run(['register', '--harness', 'grok'], grokPayload('SessionStart', 'grok-c-3', repo));
   assert.equal(C.readSession('grok-c-3').harness, 'grok');
+  run(['register'], { session_id: 'claude-leak-1', cwd: repo, hook_event_name: 'SessionStart' });
+  assert.equal(C.readSession('claude-leak-1').harness, 'claude', 'a Claude session that inherited GROK_HOOK_EVENT keeps its hooks');
 });
 
 // ---------- skills bridge ----------
