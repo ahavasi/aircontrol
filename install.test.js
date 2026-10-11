@@ -515,6 +515,32 @@ test('package installs copy skills instead of linking into the npx cache', () =>
   assert.equal(fs.existsSync(path.join(backups, 'alpha')), false);
 });
 
+test('installer wires Grok hooks only when ~/.grok exists, idempotently, and uninstall removes them', () => {
+  const run = (home, ...args) => execFileSync(process.execPath, [path.join(__dirname, 'coord.js'), ...args], {
+    cwd: __dirname, env: { ...process.env, AIRCONTROL_HOME: home, AIRCONTROL_CMUX: '1' }, encoding: 'utf8',
+  });
+  const without = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-nogrok-'));
+  run(without, 'install', '--names', 'goofy');
+  assert.equal(fs.existsSync(path.join(without, '.grok')), false, 'no Grok, no ~/.grok');
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-grok-'));
+  const hookFile = path.join(home, '.grok', 'hooks', 'aircontrol.json');
+  fs.mkdirSync(path.join(home, '.grok'));
+  run(home, 'install', '--names', 'goofy');
+  const first = fs.readFileSync(hookFile, 'utf8');
+  const config = JSON.parse(first);
+  assert.deepEqual(Object.keys(config.hooks).sort(), ['PostToolUse', 'PreToolUse', 'SessionEnd', 'SessionStart', 'Stop', 'UserPromptSubmit']);
+  for (const handler of aircontrolHandlers(config)) {
+    assert.match(handler.command, /\.claude\/hooks\/coord\.js" \w+ --harness grok$/);
+  }
+  assert.ok(Object.values(config.hooks).every((entries) => entries.every((e) => !('matcher' in e))), 'Grok rejects matchers on lifecycle events; tool events match all');
+  run(home, 'install', '--names', 'goofy');
+  assert.equal(fs.readFileSync(hookFile, 'utf8'), first);
+
+  run(home, 'uninstall');
+  assert.equal(fs.existsSync(hookFile), false);
+});
+
 test('uninstall removes only what install added', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-uninstall-'));
   const claudeDir = path.join(home, '.claude');

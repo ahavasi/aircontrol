@@ -60,6 +60,9 @@ const NODE = resolveNode();
 const source = path.join(__dirname, 'coord.js');
 const claudeDir = path.join(HOME, '.claude');
 const codexDir = path.join(HOME, '.codex');
+// GROK_HOME is Grok's own override; under AIRCONTROL_HOME the sandbox wins so tests never reach it.
+const grokDir = process.env.AIRCONTROL_HOME ? path.join(HOME, '.grok') : (process.env.GROK_HOME || path.join(HOME, '.grok'));
+const grokHookFile = path.join(grokDir, 'hooks', 'aircontrol.json');
 const claudeTarget = path.join(claudeDir, 'hooks', 'coord.js');
 const codexTarget = path.join(codexDir, 'hooks', 'coord.js');
 const cmuxRemoteSource = path.join(__dirname, 'cmux-codex-remote.sh');
@@ -239,6 +242,28 @@ function installCodexHooks() {
   ensureHook(config.hooks, 'Stop', 'nudge', codexTarget, 'aircontrol: delivering messages', codex);
   ensureHook(config.hooks, 'SessionEnd', 'deregister', codexTarget, 'aircontrol: signing off', { ...codex, timeout: 15 });
   writeJson(hooksPath, config);
+}
+
+// Grok Build reads Claude-schema hook files from ~/.grok/hooks/*.json. It would also run the
+// Claude hooks through its compat scan, but that scan can be switched off and only matches
+// Claude's tool names; with this file present coord.js ignores the compat copies. Runs the
+// Claude copy of coord.js: Grok has no runtime of its own to keep in sync.
+function installGrokHooks() {
+  if (!fs.existsSync(grokDir)) return false;
+  fs.mkdirSync(path.dirname(grokHookFile), { recursive: true });
+  const config = readJson(grokHookFile);
+  config.hooks = config.hooks || {};
+  const grok = { args: '--harness grok' };
+  ensureHook(config.hooks, 'SessionStart', 'register', claudeTarget, 'aircontrol: registering session', grok);
+  ensureHook(config.hooks, 'UserPromptSubmit', 'inject', claudeTarget, 'aircontrol: reading the room', grok);
+  // No matcher: Grok's native names (`search_replace`, `write`, `run_terminal_command`) are
+  // what reach the hook, and guard also hands over the block UserPromptSubmit could not.
+  ensureHook(config.hooks, 'PostToolUse', 'beat', claudeTarget, 'aircontrol: heartbeat', grok);
+  ensureHook(config.hooks, 'PreToolUse', 'guard', claudeTarget, 'aircontrol: checking claims', grok);
+  ensureHook(config.hooks, 'Stop', 'nudge', claudeTarget, 'aircontrol: delivering messages', grok);
+  ensureHook(config.hooks, 'SessionEnd', 'deregister', claudeTarget, 'aircontrol: signing off', grok);
+  writeJson(grokHookFile, config);
+  return true;
 }
 
 // --- Codex config.toml ---
@@ -701,7 +726,8 @@ const USAGE = `aircontrol installer
   (from a clone: node install.js [install|uninstall] ...)
 
 Copies coord.js into ~/.claude/hooks and ~/.codex/hooks, merges the lifecycle and
-guard hooks into both harnesses' settings, points Codex at CLAUDE.md files and
+guard hooks into both harnesses' settings (and ~/.grok/hooks/aircontrol.json when
+~/.grok exists), points Codex at CLAUDE.md files and
 GIT_OPTIONAL_LOCKS=0 via ~/.codex/config.toml, links ~/.claude/skills into
 ~/.agents/skills for the harnesses that read it, and adds the coordination protocol to
 ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md (with ~/.claude/CLAUDE.md mirrored into the
@@ -850,6 +876,8 @@ function uninstallCodexDaemon() {
 function uninstall(argv) {
   uninstallHooks(path.join(claudeDir, 'settings.json'));
   uninstallHooks(path.join(codexDir, 'hooks.json'));
+  uninstallHooks(grokHookFile);
+  if (fs.existsSync(grokHookFile) && !Object.keys(readJson(grokHookFile)).length) fs.rmSync(grokHookFile);
   removeRuntime(claudeTarget);
   removeRuntime(codexTarget);
   const skillNames = fs.readdirSync(path.join(__dirname, 'skills')).filter((n) => fs.existsSync(path.join(__dirname, 'skills', n, 'SKILL.md')));
@@ -941,6 +969,7 @@ function main(argv = process.argv.slice(2)) {
   linkGlobalSkills();
   installClaudeHooks();
   installCodexHooks();
+  const grokInstalled = installGrokHooks();
   ensureCodexConfigToml();
   if (argv.includes('--codex-daemon')) {
     installCodexDaemon();
@@ -963,13 +992,13 @@ function main(argv = process.argv.slice(2)) {
   if (fs.existsSync(codexOverride)) {
     console.warn(`warning: ${codexOverride} overrides AGENTS.md; add the AirControl section there or remove the override`);
   }
-  console.log('aircontrol installed for Claude Code and Codex');
+  console.log(`aircontrol installed for Claude Code, Codex${grokInstalled ? ' and Grok' : ''}`);
   console.log('Codex: run `codex login` once, then open /hooks inside Codex and trust the six aircontrol entries.');
   console.log('       Review new or changed hook commands; unchanged commands retain their existing trust.');
 }
 
 module.exports = {
-  main, uninstall, withoutAircontrolHooks, ensureHook, protocol, installClaudeHooks, installCodexHooks, upsertMarkdownSection, resolveNode, codexLaunchAgent,
+  main, uninstall, withoutAircontrolHooks, ensureHook, protocol, installClaudeHooks, installCodexHooks, installGrokHooks, upsertMarkdownSection, resolveNode, codexLaunchAgent,
   upsertTomlTopLevelArray, upsertTomlTableKey, withoutMarkedBlock, withMarkedBlock, installRepoSkills,
 };
 
