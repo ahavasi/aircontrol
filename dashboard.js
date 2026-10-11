@@ -71,7 +71,10 @@ async function cli(C, args) {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   const url = `http://127.0.0.1:${server.address().port}`;
   console.log(`aircontrol dashboard: ${url} (Ctrl-C to stop)`);
-  if (args.open) execFile('open', [url], () => {});
+  if (!args.open) return;
+  // Inside cmux, a browser split keeps the dashboard beside the agent's terminal.
+  if (process.env.CMUX_SURFACE_ID) execFile('cmux', ['browser', 'open', url, '--focus', 'false'], (e) => { if (e) execFile('open', [url], () => {}); });
+  else execFile('open', [url], () => {});
 }
 
 const PAGE = `<!doctype html>
