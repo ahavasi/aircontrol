@@ -51,3 +51,17 @@ test('dashboard log tail follows the stage log named in the phase file', async (
     assert.match(await (await fetch(`${base}/api/log/${id}`)).text(), /Test Case '-\[A b\]' passed/);
   } finally { await close(); }
 });
+test('dashboard refuses requests addressed to a foreign host (DNS rebinding)', async () => {
+  const { base, close } = await serve();
+  const http = require('http');
+  const port = new URL(base).port;
+  const status = (host) => new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path: '/api/snapshot', headers: { host } }, (res) => { res.resume(); resolve(res.statusCode); }).on('error', reject);
+  });
+  try {
+    assert.equal(await status('evil.example:' + port), 403);
+    assert.equal(await status('127.0.0.1.evil.example'), 403);
+    assert.equal(await status('localhost:' + port), 200);
+    assert.equal(await status('127.0.0.1:' + port), 200);
+  } finally { await close(); }
+});

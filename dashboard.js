@@ -6,6 +6,7 @@ const { execFile } = require('child_process');
 const Q = require('./test-queue.js');
 
 const DEVICE_TTL_MS = 10000;
+const LOCAL_HOST = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
 const LOG_BYTES = 512 * 1024;
 const KEY_LINE = /^\*\* (BUILD|TEST)|: error:|Test Case .* (passed|failed)|Test run with|Executed \d+ test|✘|✔/;
 
@@ -47,6 +48,8 @@ function createServer(C, deps = {}) {
   return http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const send = (code, type, body) => { res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store' }); res.end(body); };
+    // Binding to loopback is not enough: a DNS-rebound page reaches 127.0.0.1 under its own hostname.
+    if (!LOCAL_HOST.test(req.headers.host || '')) return send(403, 'text/plain', 'forbidden host');
     try {
       if (url.pathname === '/') return send(200, 'text/html; charset=utf-8', PAGE);
       if (url.pathname === '/api/snapshot') return send(200, 'application/json', JSON.stringify(Q.snapshot(C, { ...deps, devices: devices() })));
