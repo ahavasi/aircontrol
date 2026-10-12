@@ -2357,7 +2357,9 @@ function pairedIphones(run) {
     if (r.status !== 0) throw new Error(`devicectl list devices failed: ${lastLine(r.stderr || r.stdout)}`);
     const devices = (JSON.parse(fs.readFileSync(tmp, 'utf8')).result || {}).devices || [];
     return devices
-      .filter((d) => (d.hardwareProperties || {}).deviceType === 'iPhone' && (d.connectionProperties || {}).pairingState === 'paired' &&
+      // devicectl lists simulators as paired iPhones too; only a physical phone can take an install.
+      .filter((d) => (d.hardwareProperties || {}).deviceType === 'iPhone' && (d.hardwareProperties || {}).reality === 'physical' &&
+        (d.connectionProperties || {}).pairingState === 'paired' &&
         (d.connectionProperties || {}).tunnelState !== 'unavailable')
       .map((d) => ({ udid: d.hardwareProperties.udid || d.identifier, name: (d.deviceProperties || {}).name || '?', state: (d.connectionProperties || {}).tunnelState || '?' }));
   } finally { try { fs.unlinkSync(tmp); } catch {} }

@@ -4168,7 +4168,7 @@ function deviceStub(results) {
     },
   };
 }
-const phone = (udid, tunnelState = 'connected') => ({ hardwareProperties: { udid, deviceType: 'iPhone' }, connectionProperties: { pairingState: 'paired', tunnelState }, deviceProperties: { name: udid } });
+const phone = (udid, tunnelState = 'connected', reality = 'physical') => ({ hardwareProperties: { udid, deviceType: 'iPhone', reality }, connectionProperties: { pairingState: 'paired', tunnelState }, deviceProperties: { name: udid } });
 const locked = { status: 1, stdout: '', stderr: 'ERROR: The device is locked. (CoreDeviceError 1001)' };
 function deviceDeps(stub) {
   return { run: (a) => stub.run(a), sleep: async (ms) => { stub.clock += ms; }, now: () => stub.clock, log: (l) => stub.logs.push(l), retryMs: 20000 };
@@ -4192,7 +4192,7 @@ test('device install times out on a persistently locked device and fails fast on
   assert.equal(hard.calls.length, 1);
 });
 test('device install auto-picks the single paired iPhone and errors on zero or several', async () => {
-  const one = deviceStub({ devices: [phone('U1'), phone('U2', 'unavailable')], install: [] });
+  const one = deviceStub({ devices: [phone('U1'), phone('U2', 'unavailable'), phone('SIM', 'connected', 'simulated')], install: [] });
   assert.equal(await C.installOnDevice({ app: 'A.app' }, deviceDeps(one)), 'U1');
   const many = deviceStub({ devices: [phone('U1'), phone('U2')], install: [] });
   await assert.rejects(C.installOnDevice({ app: 'A.app' }, deviceDeps(many)), /several paired iPhones.*U1.*U2/);
