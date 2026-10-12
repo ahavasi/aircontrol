@@ -4153,3 +4153,49 @@ test('a peer cannot be named after a cloud pseudo-machine', () => {
   writeSyncConfig({ machine: 'mac', peers: [{ name: 'cloud-codex', host: 'h', dir: 'd' }, { name: 'box', host: 'h', dir: 'd' }] });
   assert.deepEqual(C.syncConfig().peers.map((p) => p.name), ['box']);
 });
+
+function deviceStub(results) {
+  const calls = [];
+  return {
+    calls, logs: [], clock: 0,
+    run(argv) {
+      calls.push(argv);
+      if (argv[0] === 'list') {
+        fs.writeFileSync(argv[argv.indexOf('--json-output') + 1], JSON.stringify({ result: { devices: results.devices || [] } }));
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      return results.install.shift() || { status: 0, stdout: '', stderr: '' };
+    },
+  };
+}
+const phone = (udid, tunnelState = 'connected', reality = 'physical') => ({ hardwareProperties: { udid, deviceType: 'iPhone', reality }, connectionProperties: { pairingState: 'paired', tunnelState }, deviceProperties: { name: udid } });
+const locked = { status: 1, stdout: '', stderr: 'ERROR: The device is locked. (CoreDeviceError 1001)' };
+function deviceDeps(stub) {
+  return { run: (a) => stub.run(a), sleep: async (ms) => { stub.clock += ms; }, now: () => stub.clock, log: (l) => stub.logs.push(l), retryMs: 20000 };
+}
+
+test('device install retries while locked, logs once per state change, then launches', async () => {
+  const stub = deviceStub({ devices: [phone('U1')], install: [locked, locked, locked, { status: 1, stdout: '', stderr: 'device is not connected' }, { status: 0, stdout: '', stderr: '' }] });
+  const udid = await C.installOnDevice({ app: '/x/App.app', launch: 'com.x.app', timeoutMin: 30 }, deviceDeps(stub));
+  assert.equal(udid, 'U1');
+  assert.deepEqual(stub.logs.slice(0, 2), ['waiting: device locked, unlock it', 'waiting: device not connected, plug it in or wake it']);
+  assert.equal(stub.logs.filter((l) => l.startsWith('waiting')).length, 2);
+  assert.equal(stub.calls.filter((a) => a[1] === 'install').length, 5);
+  assert.deepEqual(stub.calls.at(-1), ['device', 'process', 'launch', '--terminate-existing', '--device', 'U1', 'com.x.app']);
+});
+test('device install times out on a persistently locked device and fails fast on hard errors', async () => {
+  const stub = deviceStub({ devices: [], install: Array.from({ length: 50 }, () => locked) });
+  await assert.rejects(C.installOnDevice({ app: '/x/App.app', udid: 'U1', timeoutMin: 1 }, deviceDeps(stub)), /timed out waiting for device/);
+  assert.equal(stub.logs.length, 1);
+  const hard = deviceStub({ install: [{ status: 1, stdout: '', stderr: 'bad\nERROR: invalid bundle' }] });
+  await assert.rejects(C.installOnDevice({ app: '/x/App.app', udid: 'U1' }, deviceDeps(hard)), /invalid bundle/);
+  assert.equal(hard.calls.length, 1);
+});
+test('device install auto-picks the single paired iPhone and errors on zero or several', async () => {
+  const one = deviceStub({ devices: [phone('U1'), phone('U2', 'unavailable'), phone('SIM', 'connected', 'simulated')], install: [] });
+  assert.equal(await C.installOnDevice({ app: 'A.app' }, deviceDeps(one)), 'U1');
+  const many = deviceStub({ devices: [phone('U1'), phone('U2')], install: [] });
+  await assert.rejects(C.installOnDevice({ app: 'A.app' }, deviceDeps(many)), /several paired iPhones.*U1.*U2/);
+  const none = deviceStub({ devices: [], install: [] });
+  await assert.rejects(C.installOnDevice({ app: 'A.app' }, deviceDeps(none)), /no paired iPhones/);
+});

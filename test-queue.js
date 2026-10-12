@@ -136,7 +136,9 @@ function waitReason(C, cfg, all, job, external) {
     (!capacity(C, cfg, all, job.kind, external) ? 'host capacity' : null);
 }
 function chooseJob(C, cfg, all, external) {
-  const eligible = all.filter((j) => j.state === 'queued' && !waitReason(C, cfg, all, j, external));
+  const ready = all.filter((j) => j.state === 'queued' && !waitReason(C, cfg, all, j, external));
+  const builds = ready.filter((j) => j.kind === 'build');
+  const eligible = builds.length ? builds : ready;
   const streak = readJson(path.join(root(C), 'scheduler.json'))?.interactiveStreak || 0;
   const interactive = eligible.find((j) => j.priority !== 'batch');
   const batch = eligible.find((j) => j.priority === 'batch');
@@ -251,6 +253,7 @@ async function cancel(C, id, owner) {
 function validateCommand(argv, kind, cwd, cfg) {
   if (path.basename(argv[0]) === 'xcodebuild') {
     if (kind === 'build' && argv.some((s) => ['test', 'test-without-building'].includes(s))) throw new Error('simulator tests require --kind ios-test');
+    if (kind === 'build' && argv.some((s) => /platform\s*=\s*['"]?iOS['"]?\s*,\s*(id|name)\s*=/.test(s))) throw new Error('build jobs cannot target a physical device (a locked phone fails the job); build with -destination generic/platform=iOS, then install with `coord.js device install <App.app>`');
     if (kind === 'build' && argv.some((s) => /platform=iOS Simulator/.test(s) && !/generic\//.test(s))) throw new Error('device destinations require --kind ios-test; use a generic destination for builds');
     if (kind === 'ios-test-only' && (!argv.includes('test-without-building') || argv.some((s) => ['test', 'build', 'build-for-testing', 'archive', 'clean'].includes(s)))) throw new Error('test-only jobs require test-without-building');
     return;
