@@ -395,3 +395,23 @@ test('dispatcher writes the status-line cache and clears it when the queue drain
   assert.deepEqual(cache.jobs, []);
   assert.ok(Date.now() - cache.at < 60000);
 });
+
+test('queued builds run ahead of test jobs, but still wait for capacity', async () => {
+  const session = setup({ overlap: false });
+  const test1 = await Q.submit(C, options('ios-test'), session, noRunner);
+  const build = await Q.submit(C, options('build'), session, noRunner);
+  assert.equal(Q.chooseJob(C, Q.config(C), Q.jobs(C), 0).id, build.id);
+  assert.equal(Q.chooseJob(C, Q.config(C), Q.jobs(C), 1), undefined);
+  assert.notEqual(test1.id, build.id);
+});
+test('build jobs reject physical-device destinations but allow generic and simulator ones', () => {
+  const session = setup();
+  const cfg = Q.config(C);
+  for (const dest of ['platform=iOS,id=00008110-ABC', "platform=iOS, name='My iPhone'", 'platform = iOS , id = X']) {
+    assert.throws(() => Q.validateCommand(['xcodebuild', '-destination', dest, 'build'], 'build', __dirname, cfg), /coord\.js device install/);
+  }
+  for (const dest of ['generic/platform=iOS', 'generic/platform=iOS Simulator']) {
+    Q.validateCommand(['xcodebuild', '-destination', dest, 'build'], 'build', __dirname, cfg);
+  }
+  assert.ok(session);
+});

@@ -8,7 +8,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync, spawn } = require('child_process');
+const { execFileSync, spawn, spawnSync } = require('child_process');
 
 const STALE_MS = 30 * 60 * 1000;
 const READ_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -2336,6 +2336,83 @@ function renderSimList(devices, leases, nowMs, affinityKey) {
     }
   }
   return lines.length ? lines.join('\n') : 'no simulators or emulators found';
+}
+
+const DEVICE_WAIT_PATTERN = /locked|not connected|unavailable|disconnected|could not be found|no devices|passcode/i;
+
+function runDevicectl(argv) {
+  const r = spawnSync('xcrun', ['devicectl', ...argv], { encoding: 'utf8', timeout: 10 * 60 * 1000 });
+  return { status: r.status === null ? 1 : r.status, stdout: r.stdout || '', stderr: (r.stderr || '') + (r.error ? r.error.message : '') };
+}
+
+function lastLine(text) {
+  const lines = String(text || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  return lines[lines.length - 1] || 'unknown error';
+}
+
+function pairedIphones(run) {
+  const tmp = path.join(os.tmpdir(), `aircontrol-devices-${process.pid}-${Date.now()}.json`);
+  try {
+    const r = run(['list', 'devices', '--json-output', tmp]);
+    if (r.status !== 0) throw new Error(`devicectl list devices failed: ${lastLine(r.stderr || r.stdout)}`);
+    const devices = (JSON.parse(fs.readFileSync(tmp, 'utf8')).result || {}).devices || [];
+    return devices
+      .filter((d) => (d.hardwareProperties || {}).deviceType === 'iPhone' && (d.connectionProperties || {}).pairingState === 'paired' &&
+        (d.connectionProperties || {}).tunnelState !== 'unavailable')
+      .map((d) => ({ udid: d.hardwareProperties.udid || d.identifier, name: (d.deviceProperties || {}).name || '?', state: (d.connectionProperties || {}).tunnelState || '?' }));
+  } finally { try { fs.unlinkSync(tmp); } catch {} }
+}
+
+function waitState(text) {
+  if (/passcode|locked/i.test(text)) return 'device locked, unlock it';
+  if (/not connected|disconnected|could not be found|no devices/i.test(text)) return 'device not connected, plug it in or wake it';
+  return 'device unavailable';
+}
+
+async function installOnDevice(opts, deps = {}) {
+  const run = deps.run || runDevicectl;
+  const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const now = deps.now || Date.now;
+  const log = deps.log || ((l) => console.log(l));
+  const retryMs = deps.retryMs ?? 20000;
+  if (!opts.app) throw new Error('usage: coord.js device install <path/to/App.app> [--udid <UDID>] [--launch <bundleId>] [--timeout-min 30]');
+  let udid = opts.udid;
+  if (!udid) {
+    const found = pairedIphones(run);
+    if (found.length !== 1) {
+      throw new Error(`${found.length ? 'several' : 'no'} paired iPhones found; pass --udid. ${found.map((d) => `${d.udid} ${d.name} (${d.state})`).join('; ')}`.trim());
+    }
+    udid = found[0].udid;
+  }
+  const deadline = now() + (opts.timeoutMin ?? 30) * 60000;
+  let lastState = null;
+  for (;;) {
+    const r = run(['device', 'install', 'app', '--device', udid, opts.app]);
+    if (r.status === 0) break;
+    const out = `${r.stderr}\n${r.stdout}`;
+    if (!DEVICE_WAIT_PATTERN.test(out)) throw new Error(lastLine(r.stderr || r.stdout));
+    if (now() + retryMs > deadline) throw new Error(`timed out waiting for device: ${lastLine(r.stderr || r.stdout)}`);
+    const state = waitState(out);
+    if (state !== lastState) { log(`waiting: ${state}`); lastState = state; }
+    await sleep(retryMs);
+  }
+  log(`installed ${path.basename(opts.app)} on ${udid}`);
+  if (opts.launch) {
+    const r = run(['device', 'process', 'launch', '--terminate-existing', '--device', udid, opts.launch]);
+    if (r.status !== 0) throw new Error(`launch failed: ${lastLine(r.stderr || r.stdout)}`);
+    log(`launched ${opts.launch}`);
+  }
+  return udid;
+}
+
+async function cmdDevice(args, deps = {}) {
+  if (args._[1] !== 'install') throw new Error('usage: coord.js device install <path/to/App.app> [--udid <UDID>] [--launch <bundleId>] [--timeout-min 30]');
+  const timeoutMin = args['timeout-min'] === undefined ? 30 : Number(args['timeout-min']);
+  if (!(timeoutMin > 0)) throw new Error('--timeout-min must be a positive number');
+  await installOnDevice({
+    app: args._[2], udid: typeof args.udid === 'string' ? args.udid : undefined,
+    launch: typeof args.launch === 'string' ? args.launch : undefined, timeoutMin,
+  }, deps);
 }
 
 function cmdSim(args, nowMs, deps = {}) {
@@ -5126,6 +5203,9 @@ function main() {
     else if (cmd === 'names') cmdNames(args);
     else if (cmd === 'doctor') cmdDoctor(args, nowMs);
     else if (cmd === 'sim') cmdSim(args, nowMs);
+    else if (cmd === 'device') {
+      cmdDevice(args).catch((e) => { console.error(`aircontrol error: ${e.message}`); process.exitCode = 1; });
+    }
     else if (cmd === 'test') {
       require('./test-queue.js').cli(module.exports, process.argv.slice(2)).catch((e) => { console.error(`aircontrol error: ${e.message}`); process.exitCode = 1; });
     }
@@ -5153,9 +5233,10 @@ function main() {
       require(installer).main(process.argv.slice(2));
     }
     else {
-      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|ledger|handoff|cloud|relay|worktrees|disk|browsers|tasks|retro|log|skills|peek|test|dashboard> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
+      console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|device|ledger|handoff|cloud|relay|worktrees|disk|browsers|tasks|retro|log|skills|peek|test|dashboard> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
       console.error('       coord.js skills <status|link|unlink> [--repo path|--global] [--targets agents,grok] [--dry-run] [--json] — mirror .claude/skills into the dirs other harnesses read');
       console.error('       coord.js sim <list|acquire|release> [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
+      console.error('       coord.js device install <path/to/App.app> [--udid UDID] [--launch bundleId] [--timeout-min 30] — install on a paired iPhone, waiting while it is locked or unplugged');
       console.error('       coord.js ledger <add|list|show|take|note|block|unblock|done|drop> [--repo .|all|path] [--title "…"] [--points-at ref] [--status …] [--priority low|normal|high|urgent] [--depends-on id1,id2] [--mine] [--notes] — list omits notes; show <id> prints them');
       console.error('       coord.js test <submit|status|list|line|watch|cancel> [--json] — list shows the whole queue; line --session <name> prints the status-line segment');
       console.error('       coord.js dashboard [--port 7788] [--open] — local live view (a cmux browser split when run inside cmux) of the queue, verify runs and simulators');
@@ -5202,7 +5283,7 @@ module.exports = {
   readLeases, readLease, tryLease, releaseLease, releaseSessionLeases, shutdownLeaseDevice, shutdownAndReleaseLeases, quitSimulatorIfIdle, pruneLeases, touchLeases,
   readAffinity, writeAffinity, affinityFor, recordAffinity, clearAffinity, appInstalled,
   simDeviceRoot, installedBundleIds,
-  acquireDevice, renderSimList, describeLease, cmdSim, SEED_PROBE_LIMIT,
+  acquireDevice, renderSimList, describeLease, cmdSim, cmdDevice, installOnDevice, pairedIphones, SEED_PROBE_LIMIT,
   cmdWorktrees, selectBrowserProcs, classifyBrowserProcs, readAllProcs, liveClaudePids, browserContext, cmdBrowsers, reapOwnBrowsers, reapOrphanBrowsers,
   parseProcTable, claudeAncestor, classifyTaskProcs, descendantsOf, readTaskProcs, reapOwnTasks, cmdTasks,
   ownTasksRunning,
