@@ -86,7 +86,14 @@ const PAGE = `<!doctype html>
 :root[data-theme=dark]{--bg:#0f1115;--card:#171a21;--ink:#e6e8ee;--mute:#8b93a7;--line:#262b36;--accent:#818cf8;--ok:#3ccf91;--bad:#f97066;--warn:#fdb022;--track:#222733}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif}
 main{max-width:1100px;margin:0 auto;padding:20px 16px 48px}
-header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:16px}h1{font-size:20px;margin:0}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}h1{font-size:20px;margin:0}
+#updated{font-size:12px}#updated.off{color:var(--bad)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:8px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;min-width:0}
+.stat b{display:block;font-size:20px;font-weight:600;line-height:1.2;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat small{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin-bottom:2px}
+.stat .sub{display:block;font-size:12px;color:var(--mute);margin-top:2px}
+.stat.hot b{color:var(--accent)}
 .mute{color:var(--mute)}.mono{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin:24px 0 8px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:8px;cursor:pointer}
@@ -105,7 +112,8 @@ pre{white-space:pre-wrap;word-break:break-word;margin:10px 0 0;max-height:360px;
 .empty{padding:14px;border:1px dashed var(--line);border-radius:12px;color:var(--mute)}
 button{font:inherit;font-size:12px;background:none;border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:2px 8px;cursor:pointer}
 </style></head><body><main>
-<header><h1>Aircontrol queue</h1><span id="meta" class="mute"></span></header>
+<header><h1>Aircontrol queue</h1><span id="updated" class="mute"></span></header>
+<div id="stats" class="stats"></div>
 <h2>Running</h2><div id="running"></div>
 <h2>Queued</h2><div id="queued"></div>
 <h2>Verify runs</h2><div id="pipelines"></div>
@@ -150,11 +158,19 @@ function render(s) {
   const active = s.jobs.filter((j) => ['starting','running','cleaning'].includes(j.state));
   const queued = s.jobs.filter((j) => j.state === 'queued');
   const done = s.jobs.filter((j) => ['succeeded','failed','cancelled','blocked'].includes(j.state));
-  document.getElementById('meta').textContent = active.length + ' running · ' + queued.length + ' queued · sims ' +
-    s.devices.filter((d) => d.holder).length + '/' + s.config.maxSimulators + (s.config.overlap ? ' · overlap on' : '') +
-    (s.forecast && (active.length || queued.length) ? ' · drains in ~' + clock(s.forecast.drainMs) + ' (' + new Date(s.forecast.finishAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ')' +
-      (s.forecast.lanes ? ' · build lane ' + clock(s.forecast.lanes.build) + ' · sim lane ' + clock(s.forecast.lanes.simulator) : '') +
-      (s.forecast.unknownEstimates ? ' · ' + s.forecast.unknownEstimates + ' estimated from similar runs' : '') : '') + ' · updated ' + new Date(s.at).toLocaleTimeString();
+  const stat = (label, value, sub, cls) => '<div class="stat' + (cls ? ' ' + cls : '') + '"><small>' + label + '</small><b>' + value + '</b>' + (sub ? '<span class="sub">' + sub + '</span>' : '') + '</div>';
+  const at = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const pending = active.length + queued.length;
+  const f = pending && s.forecast ? s.forecast : null;
+  const tiles = [
+    stat('Running', active.length, active.length ? esc(active.map((j) => j.label).join(', ')) : 'idle', active.length ? 'hot' : ''),
+    stat('Queued', queued.length, queued.length ? (f && f.unknownEstimates ? f.unknownEstimates + ' of ' + queued.length + ' estimated' : 'durations known') : 'empty'),
+    stat('Drains in', f ? '~' + clock(f.drainMs) : '—', f ? 'done by ' + at(f.finishAt) : 'nothing pending'),
+  ];
+  if (f && f.lanes) tiles.push(stat('Build lane', clock(f.lanes.build), 'compile work queued'), stat('Sim lane', clock(f.lanes.simulator), 'simulator work queued'));
+  tiles.push(stat('Simulators', s.devices.filter((d) => d.holder).length + '/' + s.config.maxSimulators, s.config.overlap ? 'overlap on' : 'serial'));
+  document.getElementById('stats').innerHTML = tiles.join('');
+  const up = document.getElementById('updated'); up.textContent = 'updated ' + new Date(s.at).toLocaleTimeString(); up.classList.remove('off');
   fill('running', active.map((j) => job(j, now, true)), 'Nothing running.');
   fill('queued', queued.map((j) => job(j, now, false)), 'Queue empty.');
   fill('pipelines', s.pipelines.map((p) => {
@@ -168,7 +184,7 @@ function render(s) {
   fill('recent', done.map((j) => job(j, now, false)), 'Nothing finished recently.');
 }
 async function poll() {
-  try { last = await (await fetch('/api/snapshot')).json(); await refreshLogs(); render(last); } catch (e) { document.getElementById('meta').textContent = 'disconnected: ' + e.message; }
+  try { last = await (await fetch('/api/snapshot')).json(); await refreshLogs(); render(last); } catch (e) { const up = document.getElementById('updated'); up.textContent = 'disconnected: ' + e.message; up.classList.add('off'); }
   setTimeout(poll, 2000);
 }
 document.addEventListener('click', async (e) => {
