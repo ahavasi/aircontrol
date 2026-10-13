@@ -27,7 +27,10 @@ test('dashboard serves the page, a snapshot and filtered or raw log tails', asyn
   try {
     const page = await fetch(base + '/');
     assert.equal(page.status, 200);
-    assert.match(await page.text(), /<title>Aircontrol Queue<\/title>/);
+    const html = await page.text();
+    assert.match(html, /<title>Aircontrol Queue<\/title>/);
+    assert.match(html, /id="stats" class="stats"/);
+    for (const label of ['Running', 'Queued', 'Drains in', 'Build lane', 'Sim lane', 'Simulators']) assert.ok(html.includes("'" + label + "'"), label);
     const snap = await (await fetch(base + '/api/snapshot')).json();
     assert.equal(snap.jobs[0].id, id);
     assert.deepEqual(Object.keys(snap).sort(), ['at', 'config', 'devices', 'forecast', 'jobs', 'pipelines']);
