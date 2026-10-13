@@ -3,10 +3,11 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
+const os = require('os');
 
 const ACTIVE = new Set(['starting', 'running', 'cleaning']);
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'blocked']);
-const DEFAULTS = { enabled: false, overlap: false, maxXcode: 1, maxSimulators: 1, jobs: 4, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'] };
+const DEFAULTS = { enabled: false, overlap: false, maxXcode: 1, maxSimulators: 1, jobs: 4, jobsSolo: null, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'] };
 const simulatorJob = (kind) => ['ios-test', 'ios-test-only'].includes(kind);
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const root = (C) => path.join(path.dirname(C.configFile()), 'test-jobs');
@@ -27,6 +28,8 @@ function config(C) {
   for (const key of ['maxXcode', 'maxSimulators', 'jobs']) {
     if (!Number.isInteger(result[key]) || result[key] < 1) throw new Error('testing.' + key + ' must be a positive integer');
   }
+  if (result.jobsSolo === null || result.jobsSolo === undefined) result.jobsSolo = Math.max(result.jobs, os.cpus().length - 2);
+  else if (!Number.isInteger(result.jobsSolo) || result.jobsSolo < 1) throw new Error('testing.jobsSolo must be a positive integer');
   for (const key of ['allowedNames', 'protectedDevices', 'runnerScripts']) {
     if (!Array.isArray(result[key]) || !result[key].every((s) => typeof s === 'string' && s)) throw new Error('invalid testing.' + key);
   }
@@ -261,7 +264,12 @@ function validateCommand(argv, kind, cwd, cfg) {
   const registered = path.basename(argv[0]).startsWith('node') && argv[1] && cfg.runnerScripts.some((s) => path.resolve(cwd, s) === path.resolve(cwd, argv[1]));
   if (!registered) throw new Error('submit xcodebuild or a configured trusted runner script');
 }
-function commandForJob(argv, job, cfg) {
+// A build sharing the host with a simulator test keeps the bounded operation count; a build
+// running alone may use the cores the serial default left idle.
+function jobsFor(cfg, all, job) {
+  return all.some((j) => j.id !== job.id && ACTIVE.has(j.state) && simulatorJob(j.kind)) ? cfg.jobs : cfg.jobsSolo;
+}
+function commandForJob(argv, job, cfg, jobCount = cfg.jobs) {
   if (path.basename(argv[0]) !== 'xcodebuild') return argv;
   const controlled = new Set(['-jobs', '-parallel-testing-enabled', '-parallel-testing-worker-count', '-maximum-parallel-testing-workers', '-maximum-concurrent-test-simulator-destinations', '-parallelize-tests-among-destinations']);
   if (simulatorJob(job.kind)) controlled.add('-destination');
@@ -271,7 +279,7 @@ function commandForJob(argv, job, cfg) {
     if (!controlled.has(flag)) { result.push(argv[i]); continue; }
     if (flag !== '-parallelize-tests-among-destinations' && !argv[i].includes('=')) i++;
   }
-  result.push('-jobs', String(cfg.jobs), '-parallel-testing-enabled', 'NO', '-parallel-testing-worker-count', '1', '-maximum-concurrent-test-simulator-destinations', '1');
+  result.push('-jobs', String(jobCount), '-parallel-testing-enabled', 'NO', '-parallel-testing-worker-count', '1', '-maximum-concurrent-test-simulator-destinations', '1');
   if (simulatorJob(job.kind)) result.push('-destination', 'platform=iOS Simulator,id=' + job.device.key);
   return result;
 }
@@ -379,9 +387,13 @@ function trackProgress(logPath, out, phaseFile, intervalMs = 3000) {
 const VOLATILE = new Set(['-derivedDataPath', '-destination', '-resultBundlePath', '-authenticationKeyPath', '-authenticationKeyID', '-authenticationKeyIssuerID', '--pipeline']);
 function fingerprint(job) {
   const argv = [];
+  const cwd = job.cwd ? job.cwd.replace(/\/+$/, '') + '/' : null;
+  // The interpreter path (nvm vs Homebrew node) and the runner script's worktree path change
+  // between sessions without changing what runs; a sibling worktree must share the history.
   for (let i = 0; i < (job.command || []).length; i++) {
-    if (VOLATILE.has(job.command[i])) { i++; continue; }
-    argv.push(job.command[i]);
+    const arg = String(job.command[i]);
+    if (VOLATILE.has(arg)) { i++; continue; }
+    argv.push(i === 0 ? path.basename(arg) : cwd && arg.startsWith(cwd) ? arg.slice(cwd.length) : arg);
   }
   return crypto.createHash('sha1').update([job.kind, job.repo || path.basename(job.cwd || ''), ...argv].join('\0')).digest('hex').slice(0, 16);
 }
@@ -505,7 +517,8 @@ async function work(C, id) {
   atomic(file(C, id), job);
   const logFd = fs.openSync(job.log, 'a', 0o600);
   let tracker = null;
-  const env = { ...process.env, AIRCONTROL_TEST_JOB_ID: id, AIRCONTROL_TEST_JOBS: String(config(C).jobs), AIRCONTROL_SIM_UDID: job.device?.key || '',
+  const jobCount = jobsFor(config(C), jobs(C), job);
+  const env = { ...process.env, AIRCONTROL_TEST_JOB_ID: id, AIRCONTROL_TEST_JOBS: String(jobCount), AIRCONTROL_SIM_UDID: job.device?.key || '',
     AIRCONTROL_TEST_METRICS_PATH: path.join(root(C), id + '.metrics.json'), AIRCONTROL_TEST_PHASE_PATH: path.join(root(C), id + '.phase.json') };
   try {
     if (job.device) {
@@ -517,7 +530,7 @@ async function work(C, id) {
     const begin = Date.now();
     job.phase = 'command'; job.commandStartedAt = begin; atomic(file(C, id), job);
     tracker = trackProgress(job.log, path.join(root(C), id + '.progress.json'), env.AIRCONTROL_TEST_PHASE_PATH);
-    await execute(commandForJob(job.command, job, config(C)), job, env, logFd);
+    await execute(commandForJob(job.command, job, config(C), jobCount), job, env, logFd);
     job.timings.commandMs = Date.now() - begin;
     job.result = 'succeeded';
   } catch (e) { job.result = 'failed'; job.error = e.message; }
@@ -670,10 +683,52 @@ function viewJob(j, now) {
     progressText: formatProgress(j, now), timings: j.timings || null, error: j.error || null, tests: j.tests ?? null,
   };
 }
+// How long until the queue drains, and when each queued job should start. Running jobs
+// contribute what they have left; queued jobs their recorded estimate, or the median of finished
+// jobs of the same kind when nothing has run that command yet. With overlap on, builds and
+// simulator tests drain on separate lanes, a legacy combined job holds both, and a test chunk
+// cannot start before its own pipeline's build finishes. Priority reordering is not modelled.
+function forecast(cfg, view, records, now) {
+  const byKind = {}; const allRuns = []; const overheads = [];
+  for (const j of records) {
+    const ms = j.timings?.commandMs;
+    if (j.state === 'succeeded' && Number.isFinite(ms)) { (byKind[j.kind] ||= []).push(ms); allRuns.push(ms); }
+    if (j.device && Number.isFinite(j.timings?.bootMs)) overheads.push((j.timings.bootMs || 0) + (j.timings.cleanupMs || 0));
+  }
+  const overhead = median(overheads) || 15000;
+  let unknown = 0;
+  const expected = (j) => {
+    if (j.estimateMs === null || j.estimateMs === undefined) unknown++;
+    return (j.estimateMs ?? median(byKind[j.kind]) ?? median(allRuns) ?? 60000) + (simulatorJob(j.kind) ? overhead : 0);
+  };
+  const lanesOf = (j) => !cfg.overlap || j.kind === 'ios-test' ? ['build', 'sim'] : [simulatorJob(j.kind) ? 'sim' : 'build'];
+  const clock = { build: 0, sim: 0 };
+  for (const j of view.filter((x) => ACTIVE.has(x.state))) {
+    const left = j.phase === 'cleanup' ? 5000 : Math.max(5000, j.remainingMs ?? expected(j) - (j.elapsedMs || 0));
+    for (const lane of lanesOf(j)) clock[lane] = Math.max(clock[lane], left);
+  }
+  const buildEta = {};
+  for (const j of view.filter((x) => ACTIVE.has(x.state) && x.kind === 'build' && x.pipelineId)) buildEta[j.pipelineId] = clock.build;
+  const queued = view.filter((x) => x.state === 'queued');
+  const ordered = [...queued.filter((j) => j.kind === 'build'), ...queued.filter((j) => j.kind !== 'build')];
+  const jobs = {};
+  for (const j of ordered) {
+    const lanes = lanesOf(j);
+    const gate = j.kind !== 'build' && j.pipelineId && buildEta[j.pipelineId] !== undefined ? buildEta[j.pipelineId] : 0;
+    const startsInMs = Math.max(gate, ...lanes.map((lane) => clock[lane]));
+    const etaMs = startsInMs + expected(j);
+    for (const lane of lanes) clock[lane] = etaMs;
+    if (j.kind === 'build' && j.pipelineId) buildEta[j.pipelineId] = etaMs;
+    jobs[j.id] = { startsInMs, etaMs };
+  }
+  const drainMs = Math.max(clock.build, clock.sim);
+  return { drainMs, finishAt: now + drainMs, lanes: cfg.overlap ? { build: clock.build, simulator: clock.sim } : null, unknownEstimates: unknown, jobs };
+}
 function snapshot(C, deps = {}) {
   const now = deps.now || Date.now();
   const cfg = config(C);
-  const all = status(C).filter((j) => !TERMINAL.has(j.state) || now - (j.finishedAt || 0) < RECENT_MS)
+  const records = status(C);
+  const all = records.filter((j) => !TERMINAL.has(j.state) || now - (j.finishedAt || 0) < RECENT_MS)
     .sort((a, b) => rank(a) - rank(b) || (rank(a) === 2 ? (b.finishedAt || 0) - (a.finishedAt || 0) : a.sequence - b.sequence)).map((j) => viewJob(j, now));
   const pipelines = [];
   for (const j of all.filter((x) => x.pipelineId)) {
@@ -693,7 +748,10 @@ function snapshot(C, deps = {}) {
     return { name: d.name, key: d.key, runtime: d.runtime, state: d.state, holder: lease ? lease.sessionName || C.friendlyName(lease.sessionId) : null,
       jobId: lease?.jobId || null, purpose: lease?.purpose || null };
   });
-  return { at: now, config: { enabled: cfg.enabled, overlap: cfg.overlap, maxXcode: cfg.maxXcode, maxSimulators: cfg.maxSimulators }, jobs: all, pipelines, devices };
+  const outlook = forecast(cfg, all, records, now);
+  for (const j of all) if (outlook.jobs[j.id]) Object.assign(j, outlook.jobs[j.id]);
+  const { jobs: _perJob, ...queue } = outlook;
+  return { at: now, config: { enabled: cfg.enabled, overlap: cfg.overlap, maxXcode: cfg.maxXcode, maxSimulators: cfg.maxSimulators }, jobs: all, pipelines, devices, forecast: queue };
 }
 // The status line redraws every second; it reads this file instead of spawning node.
 function statuslineSummary(C, all, now = Date.now()) {
@@ -721,8 +779,72 @@ function renderStatusSegment(summary, ownerName, now = Date.now()) {
 }
 function renderList(snap) {
   if (!snap.jobs.length) return 'queue empty';
-  return snap.jobs.map((j) => [j.id, j.state.padEnd(9), (j.state === 'queued' ? '#' + j.queuePosition : j.phaseLabel).padEnd(18),
-    j.ownerName.padEnd(22), j.label.padEnd(28), j.worktree || '-', j.progressText ? '· ' + j.progressText : ''].join(' ')).join('\n');
+  const lines = snap.jobs.map((j) => [j.id, j.state.padEnd(9), (j.state === 'queued' ? '#' + j.queuePosition : j.phaseLabel).padEnd(18),
+    j.ownerName.padEnd(22), j.label.padEnd(28), j.worktree || '-', j.progressText ? '· ' + j.progressText : '',
+    j.state === 'queued' && j.startsInMs !== undefined ? '· starts ~' + formatDuration(j.startsInMs) : ''].join(' '));
+  if (snap.forecast && snap.jobs.some((j) => j.state === 'queued' || ACTIVE.has(j.state))) {
+    lines.push(`queue drains in ~${formatDuration(snap.forecast.drainMs)} (${new Date(snap.forecast.finishAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` +
+      (snap.forecast.unknownEstimates ? ` · ${snap.forecast.unknownEstimates} job${snap.forecast.unknownEstimates === 1 ? '' : 's'} without history, estimated from similar runs` : ''));
+  }
+  return lines.join('\n');
+}
+// Throughput report over finished job records: where lane time went, how long sessions waited,
+// and whether UI chunks that shared the host with a build failed more often than chunks that
+// ran alone — the instrument the overlap setting is judged by.
+function allJobRecords(C) {
+  fs.mkdirSync(root(C), { recursive: true });
+  return fs.readdirSync(root(C)).filter((s) => /^test_[a-f0-9]{16}\.json$/.test(s)).map((s) => readJson(path.join(root(C), s))).filter(Boolean);
+}
+function median(xs) { const s = [...(xs || [])].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : undefined; }
+function percentile(xs, q) { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.min(s.length - 1, Math.floor(s.length * q))] : 0; }
+function laneMs(j) { const t = j.timings || {}; return (t.commandMs || (t.buildMs || 0) + (t.testMs || 0)) + (t.bootMs || 0) + (t.cleanupMs || 0); }
+function chunkOf(j) { const m = (j.command || []).indexOf('--chunk'); return m >= 0 ? j.command[m + 1] : null; }
+function report(C, { days = 7, now = Date.now(), records = allJobRecords(C) } = {}) {
+  const since = now - days * 86400000;
+  const all = records.filter((j) => (j.submittedAt || 0) >= since).sort((a, b) => a.submittedAt - b.submittedAt);
+  const kinds = {};
+  for (const j of all) {
+    const k = kinds[j.kind + '/' + j.state] ||= { n: 0, queue: [], command: [], test: [], laneMs: 0 };
+    k.n++; k.laneMs += laneMs(j);
+    const t = j.timings || {};
+    if (t.queueMs !== undefined) k.queue.push(t.queueMs);
+    if (t.commandMs) k.command.push(t.commandMs);
+    if (t.testMs) k.test.push(t.testMs);
+  }
+  const summary = Object.entries(kinds).sort((a, b) => b[1].n - a[1].n).map(([key, k]) => ({ key, n: k.n, laneHours: k.laneMs / 3600000,
+    queueP50: median(k.queue) || 0, queueP90: percentile(k.queue, 0.9), commandP50: median(k.command) || 0, testP50: median(k.test) || 0 }));
+  const interactive = all.filter((j) => j.priority !== 'batch' && j.state === 'succeeded' && j.startedAt).map((j) => j.startedAt - j.submittedAt);
+  const seen = new Set(); const cold = []; const warm = [];
+  for (const j of all) {
+    if (j.kind !== 'build' || j.state !== 'succeeded' || j.reusedBuild) continue;
+    const ms = (j.timings || {}).buildMs || (j.timings || {}).commandMs;
+    if (!ms) continue;
+    (seen.has(j.cwd) ? warm : cold).push(ms); seen.add(j.cwd);
+  }
+  const builds = all.filter((j) => j.kind === 'build' && j.startedAt && j.finishedAt);
+  const ui = { alone: { ok: 0, failed: 0 }, besideBuild: { ok: 0, failed: 0 } };
+  for (const j of all) {
+    if (j.kind !== 'ios-test-only' || !['succeeded', 'failed'].includes(j.state) || chunkOf(j) === 'unit' || !j.startedAt) continue;
+    const end = j.finishedAt || now;
+    const shared = builds.some((b) => b.id !== j.id && b.startedAt < end && b.finishedAt > j.startedAt);
+    ui[shared ? 'besideBuild' : 'alone'][j.state === 'succeeded' ? 'ok' : 'failed']++;
+  }
+  const sim = all.filter((j) => j.device && (j.timings || {}).bootMs);
+  return { days, jobs: all.length, worktrees: new Set(all.map((j) => j.cwd)).size, laneHours: all.reduce((s, j) => s + laneMs(j), 0) / 3600000,
+    kinds: summary, interactiveWait: { n: interactive.length, p50: median(interactive) || 0, p90: percentile(interactive, 0.9) },
+    builds: { cold: { n: cold.length, p50: median(cold) || 0 }, warm: { n: warm.length, p50: median(warm) || 0 } },
+    ui, bootHours: sim.reduce((s, j) => s + (j.timings.bootMs || 0) + (j.timings.cleanupMs || 0), 0) / 3600000 };
+}
+function renderReport(r) {
+  const sec = (ms) => Math.round(ms / 1000) + 's';
+  const rate = (b) => b.ok + b.failed ? Math.round(b.failed / (b.ok + b.failed) * 100) + '%' : 'n/a';
+  const lines = [`last ${r.days}d: ${r.jobs} jobs, ${r.worktrees} worktrees, lane busy ${r.laneHours.toFixed(1)}h`,
+    `interactive wait (n=${r.interactiveWait.n}): p50 ${sec(r.interactiveWait.p50)} p90 ${sec(r.interactiveWait.p90)}`,
+    `builds: cold p50 ${sec(r.builds.cold.p50)} (n=${r.builds.cold.n}), warm p50 ${sec(r.builds.warm.p50)} (n=${r.builds.warm.n})`,
+    `UI chunk failures: alone ${rate(r.ui.alone)} (${r.ui.alone.ok + r.ui.alone.failed}), beside a build ${rate(r.ui.besideBuild)} (${r.ui.besideBuild.ok + r.ui.besideBuild.failed})`,
+    `simulator boot+shutdown: ${r.bootHours.toFixed(1)}h`, '', 'kind/state'.padEnd(26) + 'n'.padStart(5) + 'lane h'.padStart(8) + 'queue p50/p90'.padStart(18) + 'cmd p50'.padStart(9) + 'test p50'.padStart(10)];
+  for (const k of r.kinds) lines.push(k.key.padEnd(26) + String(k.n).padStart(5) + k.laneHours.toFixed(1).padStart(8) + (sec(k.queueP50) + '/' + sec(k.queueP90)).padStart(18) + sec(k.commandP50).padStart(9) + sec(k.testP50).padStart(10));
+  return lines.join('\n');
 }
 async function cli(C, argv) {
   const separator = argv.indexOf('--');
@@ -736,7 +858,7 @@ async function cli(C, argv) {
       if (!['true', 'false'].includes(args.enabled)) throw new Error('--enabled must be true or false');
       testing.enabled = args.enabled === 'true';
     }
-    for (const [flag, key] of [['max-xcode', 'maxXcode'], ['max-simulators', 'maxSimulators'], ['jobs', 'jobs']]) {
+    for (const [flag, key] of [['max-xcode', 'maxXcode'], ['max-simulators', 'maxSimulators'], ['jobs', 'jobs'], ['jobs-solo', 'jobsSolo']]) {
       if (args[flag] !== undefined) { const n = Number(args[flag]); if (!Number.isInteger(n) || n < 1) throw new Error('invalid --' + flag); testing[key] = n; }
     }
     if (args.overlap !== undefined) {
@@ -752,6 +874,11 @@ async function cli(C, argv) {
     const id = args._[2];
     if (id && !/^pipeline_[a-f0-9]{16}$/.test(id)) file(C, id);
     result = status(C, id); ensureRunner(C);
+  } else if (sub === 'report') {
+    const days = args.days === undefined ? 7 : Number(args.days);
+    if (!Number.isFinite(days) || days <= 0) throw new Error('--days must be a positive number');
+    const r = report(C, { days });
+    console.log(args.json ? JSON.stringify(r) : renderReport(r)); return;
   } else if (sub === 'list') {
     const snap = snapshot(C); ensureRunner(C);
     console.log(args.json ? JSON.stringify(snap) : renderList(snap)); return;
@@ -773,12 +900,12 @@ async function cli(C, argv) {
     if (sub === 'submit') result = await submit(C, { kind: args.kind, cwd: args.cwd, name: args.name,
       runtime: args.runtime, bundleId: args['bundle-id'], priority: args.priority, resource: args.resource, dependsOn: args['depends-on'] ? args['depends-on'].split(',') : [], command: separator < 0 ? [] : argv.slice(separator + 1) }, session);
     else if (sub === 'cancel') result = await cancel(C, args._[2], session.sessionId);
-    else throw new Error('usage: test submit|status|list|line|watch|cancel');
+    else throw new Error('usage: test submit|status|list|line|watch|report|cancel');
   }
   if (args.json) console.log(JSON.stringify(result));
   else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
 }
-module.exports = { snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);
