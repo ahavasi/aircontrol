@@ -30,7 +30,7 @@ test('dashboard serves the page, a snapshot and filtered or raw log tails', asyn
     assert.match(await page.text(), /<title>Aircontrol Queue<\/title>/);
     const snap = await (await fetch(base + '/api/snapshot')).json();
     assert.equal(snap.jobs[0].id, id);
-    assert.deepEqual(Object.keys(snap).sort(), ['at', 'config', 'devices', 'jobs', 'pipelines']);
+    assert.deepEqual(Object.keys(snap).sort(), ['at', 'config', 'devices', 'forecast', 'jobs', 'pipelines']);
     assert.equal(await (await fetch(`${base}/api/log/${id}`)).text(), '** BUILD SUCCEEDED **\n/a.swift:1:2: error: boom');
     assert.match(await (await fetch(`${base}/api/log/${id}?raw=1`)).text(), /^noise/);
   } finally { await close(); }

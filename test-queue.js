@@ -387,9 +387,13 @@ function trackProgress(logPath, out, phaseFile, intervalMs = 3000) {
 const VOLATILE = new Set(['-derivedDataPath', '-destination', '-resultBundlePath', '-authenticationKeyPath', '-authenticationKeyID', '-authenticationKeyIssuerID', '--pipeline']);
 function fingerprint(job) {
   const argv = [];
+  const cwd = job.cwd ? job.cwd.replace(/\/+$/, '') + '/' : null;
+  // The interpreter path (nvm vs Homebrew node) and the runner script's worktree path change
+  // between sessions without changing what runs; a sibling worktree must share the history.
   for (let i = 0; i < (job.command || []).length; i++) {
-    if (VOLATILE.has(job.command[i])) { i++; continue; }
-    argv.push(job.command[i]);
+    const arg = String(job.command[i]);
+    if (VOLATILE.has(arg)) { i++; continue; }
+    argv.push(i === 0 ? path.basename(arg) : cwd && arg.startsWith(cwd) ? arg.slice(cwd.length) : arg);
   }
   return crypto.createHash('sha1').update([job.kind, job.repo || path.basename(job.cwd || ''), ...argv].join('\0')).digest('hex').slice(0, 16);
 }
@@ -679,10 +683,52 @@ function viewJob(j, now) {
     progressText: formatProgress(j, now), timings: j.timings || null, error: j.error || null, tests: j.tests ?? null,
   };
 }
+// How long until the queue drains, and when each queued job should start. Running jobs
+// contribute what they have left; queued jobs their recorded estimate, or the median of finished
+// jobs of the same kind when nothing has run that command yet. With overlap on, builds and
+// simulator tests drain on separate lanes, a legacy combined job holds both, and a test chunk
+// cannot start before its own pipeline's build finishes. Priority reordering is not modelled.
+function forecast(cfg, view, records, now) {
+  const byKind = {}; const allRuns = []; const overheads = [];
+  for (const j of records) {
+    const ms = j.timings?.commandMs;
+    if (j.state === 'succeeded' && Number.isFinite(ms)) { (byKind[j.kind] ||= []).push(ms); allRuns.push(ms); }
+    if (j.device && Number.isFinite(j.timings?.bootMs)) overheads.push((j.timings.bootMs || 0) + (j.timings.cleanupMs || 0));
+  }
+  const overhead = median(overheads) || 15000;
+  let unknown = 0;
+  const expected = (j) => {
+    if (j.estimateMs === null || j.estimateMs === undefined) unknown++;
+    return (j.estimateMs ?? median(byKind[j.kind]) ?? median(allRuns) ?? 60000) + (simulatorJob(j.kind) ? overhead : 0);
+  };
+  const lanesOf = (j) => !cfg.overlap || j.kind === 'ios-test' ? ['build', 'sim'] : [simulatorJob(j.kind) ? 'sim' : 'build'];
+  const clock = { build: 0, sim: 0 };
+  for (const j of view.filter((x) => ACTIVE.has(x.state))) {
+    const left = j.phase === 'cleanup' ? 5000 : Math.max(5000, j.remainingMs ?? expected(j) - (j.elapsedMs || 0));
+    for (const lane of lanesOf(j)) clock[lane] = Math.max(clock[lane], left);
+  }
+  const buildEta = {};
+  for (const j of view.filter((x) => ACTIVE.has(x.state) && x.kind === 'build' && x.pipelineId)) buildEta[j.pipelineId] = clock.build;
+  const queued = view.filter((x) => x.state === 'queued');
+  const ordered = [...queued.filter((j) => j.kind === 'build'), ...queued.filter((j) => j.kind !== 'build')];
+  const jobs = {};
+  for (const j of ordered) {
+    const lanes = lanesOf(j);
+    const gate = j.kind !== 'build' && j.pipelineId && buildEta[j.pipelineId] !== undefined ? buildEta[j.pipelineId] : 0;
+    const startsInMs = Math.max(gate, ...lanes.map((lane) => clock[lane]));
+    const etaMs = startsInMs + expected(j);
+    for (const lane of lanes) clock[lane] = etaMs;
+    if (j.kind === 'build' && j.pipelineId) buildEta[j.pipelineId] = etaMs;
+    jobs[j.id] = { startsInMs, etaMs };
+  }
+  const drainMs = Math.max(clock.build, clock.sim);
+  return { drainMs, finishAt: now + drainMs, lanes: cfg.overlap ? { build: clock.build, simulator: clock.sim } : null, unknownEstimates: unknown, jobs };
+}
 function snapshot(C, deps = {}) {
   const now = deps.now || Date.now();
   const cfg = config(C);
-  const all = status(C).filter((j) => !TERMINAL.has(j.state) || now - (j.finishedAt || 0) < RECENT_MS)
+  const records = status(C);
+  const all = records.filter((j) => !TERMINAL.has(j.state) || now - (j.finishedAt || 0) < RECENT_MS)
     .sort((a, b) => rank(a) - rank(b) || (rank(a) === 2 ? (b.finishedAt || 0) - (a.finishedAt || 0) : a.sequence - b.sequence)).map((j) => viewJob(j, now));
   const pipelines = [];
   for (const j of all.filter((x) => x.pipelineId)) {
@@ -702,7 +748,10 @@ function snapshot(C, deps = {}) {
     return { name: d.name, key: d.key, runtime: d.runtime, state: d.state, holder: lease ? lease.sessionName || C.friendlyName(lease.sessionId) : null,
       jobId: lease?.jobId || null, purpose: lease?.purpose || null };
   });
-  return { at: now, config: { enabled: cfg.enabled, overlap: cfg.overlap, maxXcode: cfg.maxXcode, maxSimulators: cfg.maxSimulators }, jobs: all, pipelines, devices };
+  const outlook = forecast(cfg, all, records, now);
+  for (const j of all) if (outlook.jobs[j.id]) Object.assign(j, outlook.jobs[j.id]);
+  const { jobs: _perJob, ...queue } = outlook;
+  return { at: now, config: { enabled: cfg.enabled, overlap: cfg.overlap, maxXcode: cfg.maxXcode, maxSimulators: cfg.maxSimulators }, jobs: all, pipelines, devices, forecast: queue };
 }
 // The status line redraws every second; it reads this file instead of spawning node.
 function statuslineSummary(C, all, now = Date.now()) {
@@ -730,8 +779,14 @@ function renderStatusSegment(summary, ownerName, now = Date.now()) {
 }
 function renderList(snap) {
   if (!snap.jobs.length) return 'queue empty';
-  return snap.jobs.map((j) => [j.id, j.state.padEnd(9), (j.state === 'queued' ? '#' + j.queuePosition : j.phaseLabel).padEnd(18),
-    j.ownerName.padEnd(22), j.label.padEnd(28), j.worktree || '-', j.progressText ? '· ' + j.progressText : ''].join(' ')).join('\n');
+  const lines = snap.jobs.map((j) => [j.id, j.state.padEnd(9), (j.state === 'queued' ? '#' + j.queuePosition : j.phaseLabel).padEnd(18),
+    j.ownerName.padEnd(22), j.label.padEnd(28), j.worktree || '-', j.progressText ? '· ' + j.progressText : '',
+    j.state === 'queued' && j.startsInMs !== undefined ? '· starts ~' + formatDuration(j.startsInMs) : ''].join(' '));
+  if (snap.forecast && snap.jobs.some((j) => j.state === 'queued' || ACTIVE.has(j.state))) {
+    lines.push(`queue drains in ~${formatDuration(snap.forecast.drainMs)} (${new Date(snap.forecast.finishAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` +
+      (snap.forecast.unknownEstimates ? ` · ${snap.forecast.unknownEstimates} job${snap.forecast.unknownEstimates === 1 ? '' : 's'} without history, estimated from similar runs` : ''));
+  }
+  return lines.join('\n');
 }
 // Throughput report over finished job records: where lane time went, how long sessions waited,
 // and whether UI chunks that shared the host with a build failed more often than chunks that
@@ -740,7 +795,7 @@ function allJobRecords(C) {
   fs.mkdirSync(root(C), { recursive: true });
   return fs.readdirSync(root(C)).filter((s) => /^test_[a-f0-9]{16}\.json$/.test(s)).map((s) => readJson(path.join(root(C), s))).filter(Boolean);
 }
-function median(xs) { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : 0; }
+function median(xs) { const s = [...(xs || [])].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : undefined; }
 function percentile(xs, q) { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.min(s.length - 1, Math.floor(s.length * q))] : 0; }
 function laneMs(j) { const t = j.timings || {}; return (t.commandMs || (t.buildMs || 0) + (t.testMs || 0)) + (t.bootMs || 0) + (t.cleanupMs || 0); }
 function chunkOf(j) { const m = (j.command || []).indexOf('--chunk'); return m >= 0 ? j.command[m + 1] : null; }
@@ -757,7 +812,7 @@ function report(C, { days = 7, now = Date.now(), records = allJobRecords(C) } = 
     if (t.testMs) k.test.push(t.testMs);
   }
   const summary = Object.entries(kinds).sort((a, b) => b[1].n - a[1].n).map(([key, k]) => ({ key, n: k.n, laneHours: k.laneMs / 3600000,
-    queueP50: median(k.queue), queueP90: percentile(k.queue, 0.9), commandP50: median(k.command), testP50: median(k.test) }));
+    queueP50: median(k.queue) || 0, queueP90: percentile(k.queue, 0.9), commandP50: median(k.command) || 0, testP50: median(k.test) || 0 }));
   const interactive = all.filter((j) => j.priority !== 'batch' && j.state === 'succeeded' && j.startedAt).map((j) => j.startedAt - j.submittedAt);
   const seen = new Set(); const cold = []; const warm = [];
   for (const j of all) {
@@ -776,8 +831,8 @@ function report(C, { days = 7, now = Date.now(), records = allJobRecords(C) } = 
   }
   const sim = all.filter((j) => j.device && (j.timings || {}).bootMs);
   return { days, jobs: all.length, worktrees: new Set(all.map((j) => j.cwd)).size, laneHours: all.reduce((s, j) => s + laneMs(j), 0) / 3600000,
-    kinds: summary, interactiveWait: { n: interactive.length, p50: median(interactive), p90: percentile(interactive, 0.9) },
-    builds: { cold: { n: cold.length, p50: median(cold) }, warm: { n: warm.length, p50: median(warm) } },
+    kinds: summary, interactiveWait: { n: interactive.length, p50: median(interactive) || 0, p90: percentile(interactive, 0.9) },
+    builds: { cold: { n: cold.length, p50: median(cold) || 0 }, warm: { n: warm.length, p50: median(warm) || 0 } },
     ui, bootHours: sim.reduce((s, j) => s + (j.timings.bootMs || 0) + (j.timings.cleanupMs || 0), 0) / 3600000 };
 }
 function renderReport(r) {
@@ -850,7 +905,7 @@ async function cli(C, argv) {
   if (args.json) console.log(JSON.stringify(result));
   else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
 }
-module.exports = { jobsFor, report, renderReport, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);

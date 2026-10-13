@@ -128,7 +128,8 @@ function bar(j, now) {
 }
 function job(j, now, full) {
   const elapsed = j.startedAt ? (j.finishedAt || now) - j.startedAt : now - j.submittedAt;
-  const right = j.state === 'queued' ? '#' + j.queuePosition + (j.waitReason ? ' · ' + esc(j.waitReason) : '') + (j.estimateMs ? ' · est ' + clock(j.estimateMs) : '')
+  const right = j.state === 'queued' ? '#' + j.queuePosition + (j.waitReason ? ' · ' + esc(j.waitReason) : '') + (j.estimateMs ? ' · est ' + clock(j.estimateMs) : '') +
+      (j.startsInMs !== undefined ? ' · starts in ~' + clock(j.startsInMs) + ' · done ~' + new Date(now + j.etaMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '')
     : clock(elapsed) + (j.remainingMs > 0 ? ' · ~' + clock(j.remainingMs) + ' left' : '');
   let html = '<div class="card" data-id="' + j.id + '"><div class="row"><span class="pill ' + j.state + '">' + esc(j.phaseLabel) + '</span>' +
     '<span class="grow title">' + esc(j.label) + '</span><span class="mute">' + right + '</span></div>' +
@@ -150,7 +151,10 @@ function render(s) {
   const queued = s.jobs.filter((j) => j.state === 'queued');
   const done = s.jobs.filter((j) => ['succeeded','failed','cancelled','blocked'].includes(j.state));
   document.getElementById('meta').textContent = active.length + ' running · ' + queued.length + ' queued · sims ' +
-    s.devices.filter((d) => d.holder).length + '/' + s.config.maxSimulators + (s.config.overlap ? ' · overlap on' : '') + ' · updated ' + new Date(s.at).toLocaleTimeString();
+    s.devices.filter((d) => d.holder).length + '/' + s.config.maxSimulators + (s.config.overlap ? ' · overlap on' : '') +
+    (s.forecast && (active.length || queued.length) ? ' · drains in ~' + clock(s.forecast.drainMs) + ' (' + new Date(s.forecast.finishAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ')' +
+      (s.forecast.lanes ? ' · build lane ' + clock(s.forecast.lanes.build) + ' · sim lane ' + clock(s.forecast.lanes.simulator) : '') +
+      (s.forecast.unknownEstimates ? ' · ' + s.forecast.unknownEstimates + ' estimated from similar runs' : '') : '') + ' · updated ' + new Date(s.at).toLocaleTimeString();
   fill('running', active.map((j) => job(j, now, true)), 'Nothing running.');
   fill('queued', queued.map((j) => job(j, now, false)), 'Queue empty.');
   fill('pipelines', s.pipelines.map((p) => {

@@ -339,6 +339,8 @@ test('fingerprint ignores per-worktree paths and estimate takes the median run',
   const stage = { ...base, command: ['node', 'scripts/verify.mjs', '--run-stage', 'test', '--pipeline', '/one.json', '--chunk', 'HomeTests'] };
   assert.equal(Q.fingerprint(stage), Q.fingerprint({ ...stage, command: stage.command.map(s => s === '/one.json' ? '/two.json' : s) }));
   assert.notEqual(Q.fingerprint(stage), Q.fingerprint({ ...stage, command: stage.command.map(s => s === 'HomeTests' ? 'ScanTests' : s) }));
+  const sibling = { ...stage, cwd: '/b', command: ['/opt/homebrew/bin/node', '/b/scripts/verify.mjs', ...stage.command.slice(2)] };
+  assert.equal(Q.fingerprint({ ...stage, command: ['/Users/x/.nvm/node', '/a/scripts/verify.mjs', ...stage.command.slice(2)] }), Q.fingerprint(sibling));
   for (const ms of [300000, 900000, 600000]) Q.recordHistory(C, { ...base, timings: { commandMs: ms }, progress: { ui: { passed: 5, failed: 1 }, unit: { total: 1183 } } });
   const history = JSON.parse(fs.readFileSync(path.join(Q.root(C), 'history.json'), 'utf8'));
   assert.deepEqual(Q.estimate(base, history), { commandMs: 600000, ui: 6, unit: 1183 });
@@ -409,7 +411,34 @@ test('snapshot lists active, queued and recent jobs, groups verify runs and join
   assert.equal(snap.jobs[0].worktree, 'app-feature');
   assert.deepEqual(snap.pipelines.map((p) => [p.name, p.state, p.jobs.length]), [['verify_abc', 'running', 3]]);
   assert.deepEqual(snap.devices, [{ name: 'Aircontrol-Agent', key: device.key, runtime: 'iOS 26.5', state: 'shutdown', holder: 'owner-name', jobId: 'test_00000000000000a2', purpose: null }]);
-  assert.match(Q.renderList(snap), /test_00000000000000a3 queued +#1 .*ScanUITests/);
+  assert.match(Q.renderList(snap), /test_00000000000000a3 queued +#1 .*ScanUITests.*starts ~/);
+  assert.match(Q.renderList(snap), /queue drains in ~\d+m/);
+  assert.ok(snap.forecast.drainMs > 0 && snap.jobs[1].startsInMs >= 0 && snap.jobs[1].etaMs > snap.jobs[1].startsInMs);
+});
+test('forecast drains two lanes under overlap, gates chunks on their build, and falls back to similar runs', () => {
+  const now = 5_000_000;
+  const records = [
+    { kind: 'build', state: 'succeeded', timings: { commandMs: 60_000 } }, { kind: 'build', state: 'succeeded', timings: { commandMs: 80_000 } }, { kind: 'build', state: 'succeeded', timings: { commandMs: 100_000 } },
+    { kind: 'ios-test-only', state: 'succeeded', device: {}, timings: { commandMs: 200_000, bootMs: 8000, cleanupMs: 2000 } },
+    { kind: 'ios-test-only', state: 'failed', device: {}, timings: { commandMs: 900_000, bootMs: 12_000, cleanupMs: 2000 } },
+  ];
+  const view = [
+    { id: 'r1', kind: 'ios-test-only', state: 'running', phase: 'test', pipelineId: 'pA', estimateMs: 120_000, remainingMs: 30_000, elapsedMs: 100_000 },
+    { id: 'q1', kind: 'ios-test-only', state: 'queued', pipelineId: 'pA', estimateMs: 50_000 },
+    { id: 'q2', kind: 'build', state: 'queued', pipelineId: 'pB', estimateMs: null },
+    { id: 'q3', kind: 'ios-test-only', state: 'queued', pipelineId: 'pB', estimateMs: 40_000 },
+  ];
+  const overlap = Q.forecast({ overlap: true }, view, records, now);
+  // build lane: q2 starts now (80s median build). sim lane: r1 30s left → q1 (50s + 14s boot/cleanup) → q3 needs q2's build (80s) and the lane (94s), then 40s + 14s.
+  assert.deepEqual(overlap.jobs, { q2: { startsInMs: 0, etaMs: 80_000 }, q1: { startsInMs: 30_000, etaMs: 94_000 }, q3: { startsInMs: 94_000, etaMs: 148_000 } });
+  assert.deepEqual(overlap.lanes, { build: 80_000, simulator: 148_000 });
+  assert.equal(overlap.drainMs, 148_000); assert.equal(overlap.finishAt, now + 148_000); assert.equal(overlap.unknownEstimates, 1);
+  const serial = Q.forecast({ overlap: false }, view, records, now);
+  assert.deepEqual(serial.jobs, { q2: { startsInMs: 30_000, etaMs: 110_000 }, q1: { startsInMs: 110_000, etaMs: 174_000 }, q3: { startsInMs: 174_000, etaMs: 228_000 } });
+  assert.equal(serial.lanes, null); assert.equal(serial.drainMs, 228_000);
+  const idle = Q.forecast({ overlap: true }, [], [], now);
+  assert.equal(idle.drainMs, 0);
+  assert.equal(Q.forecast({ overlap: true }, [{ id: 'x', kind: 'build', state: 'queued' }], [], now).jobs.x.etaMs, 60_000);
 });
 test('status-line segment shows own jobs, counts others, and hides when idle or stale', () => {
   const now = 10_000_000;
