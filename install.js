@@ -640,6 +640,8 @@ ${delivery}
   operation, writable handle, or Git process is active.
 - Never edit the installed hook copy directly: the next install overwrites it. Update with
   \`npx aircontrol@latest install\`, or edit a clone of the repository and run \`node install.js\`.
+  Once a clone has installed, update from that clone: the package refuses to replace a clone install
+  without \`--force\`, because the published package can lag the clone's main.
 `;
 }
 
@@ -741,12 +743,34 @@ latter). Idempotent; makes .bak-aircontrol backups.
                         is active; restart only the idle dispatcher during installation.
   --no-mirror-global    Stop mirroring ~/.claude/CLAUDE.md into ~/.codex/AGENTS.md
                         (remembered in config.json; removes the existing mirror block).
+  --force               Let the published package replace hooks installed from a git clone.
   --purge               With uninstall: also delete ~/.claude/agents (roster, messages,
                         ledger). Kept by default.
   --help, -h            Print this and install nothing.
 `;
 
-const KNOWN_FLAGS = new Set(['--names', '--no-mirror-global', '--codex-daemon', '--paused-queue']);
+const KNOWN_FLAGS = new Set(['--names', '--no-mirror-global', '--codex-daemon', '--paused-queue', '--force']);
+
+const sourceStamp = path.join(claudeDir, 'hooks', 'aircontrol-source.json');
+function installSource() {
+  const kind = process.env.AIRCONTROL_INSTALL_SOURCE || (fs.existsSync(path.join(__dirname, '.git')) ? 'git' : 'package');
+  let commit = null;
+  if (kind === 'git') {
+    try { commit = execFileSync('git', ['-C', __dirname, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch {}
+  }
+  return { kind, dir: __dirname, commit, version: require('./package.json').version };
+}
+// The published package can lag a clone's main without a version bump, so a package
+// install over a clone install is a silent downgrade unless the operator forces it.
+function downgradeRefusal(src, argv) {
+  if (src.kind !== 'package' || argv.includes('--force')) return null;
+  let stamp = null;
+  try { stamp = JSON.parse(fs.readFileSync(sourceStamp, 'utf8')); } catch { return null; }
+  if (!stamp || stamp.kind !== 'git') return null;
+  return `the installed hooks came from a git clone (${stamp.dir}${stamp.commit ? ' @ ' + stamp.commit : ''}); ` +
+    `installing the published package over them can remove unreleased features. ` +
+    `Run \`node install.js\` in that clone instead, or pass --force to replace them.`;
+}
 
 function codexLaunchAgent(binary) {
   const xml = s => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
@@ -924,6 +948,13 @@ function main(argv = process.argv.slice(2)) {
     return;
   }
 
+  const src = installSource();
+  const refusal = downgradeRefusal(src, argv);
+  if (refusal) {
+    process.stderr.write(`aircontrol: ${refusal}\n`);
+    process.exitCode = 1;
+    return;
+  }
   if (coord.parseArgs(argv)['no-mirror-global']) writeConfig({ mirrorGlobalDoc: false });
   writeConfig({ nameStyle: resolveNameStyle() });
 
@@ -993,6 +1024,7 @@ function main(argv = process.argv.slice(2)) {
   if (fs.existsSync(codexOverride)) {
     console.warn(`warning: ${codexOverride} overrides AGENTS.md; add the AirControl section there or remove the override`);
   }
+  fs.writeFileSync(sourceStamp, JSON.stringify({ ...src, installedAt: new Date().toISOString() }) + '\n');
   console.log(`aircontrol installed for Claude Code, Codex${grokInstalled ? ' and Grok' : ''}`);
   console.log('Codex: run `codex login` once, then open /hooks inside Codex and trust the six aircontrol entries.');
   console.log('       Review new or changed hook commands; unchanged commands retain their existing trust.');
