@@ -596,3 +596,29 @@ test('an installed hook copy refuses to install and points at npx', () => {
     (err) => /npx aircontrol install/.test(err.stderr),
   );
 });
+
+test('package install refuses to replace a clone install unless forced', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-install-'));
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+  const run = (source, args = []) => execFileSync(process.execPath, [path.join(__dirname, 'install.js'), ...args], {
+    cwd: __dirname,
+    env: { ...process.env, AIRCONTROL_HOME: home, AIRCONTROL_NAME_STYLE: '', AIRCONTROL_CMUX: '1', AIRCONTROL_INSTALL_SOURCE: source },
+    encoding: 'utf8', stdio: 'pipe',
+  });
+  const stampFile = path.join(home, '.claude', 'hooks', 'aircontrol-source.json');
+
+  run('package');
+  assert.equal(JSON.parse(fs.readFileSync(stampFile, 'utf8')).kind, 'package');
+  run('package');
+
+  run('git');
+  assert.equal(JSON.parse(fs.readFileSync(stampFile, 'utf8')).kind, 'git');
+  const before = fs.statSync(path.join(home, '.claude', 'hooks', 'coord.js')).mtimeMs;
+  assert.throws(() => run('package'), (e) => /came from a git clone/.test(String(e.stderr)));
+  assert.equal(fs.statSync(path.join(home, '.claude', 'hooks', 'coord.js')).mtimeMs, before);
+  assert.equal(JSON.parse(fs.readFileSync(stampFile, 'utf8')).kind, 'git');
+
+  run('package', ['--force']);
+  assert.equal(JSON.parse(fs.readFileSync(stampFile, 'utf8')).kind, 'package');
+});
