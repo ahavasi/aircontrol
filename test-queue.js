@@ -103,7 +103,11 @@ function activeLease(C, lease) {
   const job = readJson(file(C, lease.jobId));
   return !!job && ACTIVE.has(job.state);
 }
-function manualCount(C) { return C.readLeases().filter((s) => s.platform === 'ios' && !s.jobId).length; }
+// A session's own manual lease never blocks its own job: tick() hands that
+// device to the job instead (see acquireDevice), so counting it would deadlock.
+function manualLeases(C, owner) {
+  return C.readLeases().filter((s) => s.platform === 'ios' && !s.jobId && (!owner || s.sessionId !== owner));
+}
 function externalBuilds(existing = []) {
   try {
     const groups = new Set(existing.filter((j) => ACTIVE.has(j.state)).map((j) => j.workerPid));
@@ -111,14 +115,23 @@ function externalBuilds(existing = []) {
       .filter((s) => { const match = s.trim().match(/^(\d+)\s+(.*)$/); return match && !groups.has(Number(match[1])) && /(?:^|\/)xcodebuild$/.test(match[2]); }).length;
   } catch { return 1; }
 }
-function capacity(C, cfg, existing, kind, external = externalBuilds(existing)) {
+function capacityBlock(C, cfg, existing, kind, external = externalBuilds(existing), owner) {
   const active = existing.filter((j) => ACTIVE.has(j.state));
-  if (external > 0) return false;
+  if (external > 0) return 'outside xcodebuild running';
   if (cfg.overlap) {
-    if (kind !== 'ios-test-only' && active.some((j) => j.kind !== 'ios-test-only')) return false;
-    if (simulatorJob(kind) && active.some((j) => simulatorJob(j.kind))) return false;
-  } else if (active.length >= cfg.maxXcode) return false;
-  return !simulatorJob(kind) || manualCount(C) + active.filter((j) => simulatorJob(j.kind)).length < (cfg.overlap ? 1 : cfg.maxSimulators);
+    if (kind !== 'ios-test-only' && active.some((j) => j.kind !== 'ios-test-only')) return 'host capacity';
+    if (simulatorJob(kind) && active.some((j) => simulatorJob(j.kind))) return 'host capacity';
+  } else if (active.length >= cfg.maxXcode) return 'host capacity';
+  if (!simulatorJob(kind)) return null;
+  const manual = manualLeases(C, owner);
+  const activeSims = active.filter((j) => simulatorJob(j.kind)).length;
+  if (manual.length + activeSims < (cfg.overlap ? 1 : cfg.maxSimulators)) return null;
+  if (!manual.length) return 'host capacity';
+  const holders = [...new Set(manual.map((l) => l.sessionName || C.friendlyName?.(l.sessionId) || l.sessionId))];
+  return `simulator held by ${holders.join(', ')} (manual lease)`;
+}
+function capacity(C, cfg, existing, kind, external = externalBuilds(existing), owner) {
+  return !capacityBlock(C, cfg, existing, kind, external, owner);
 }
 function dependencyState(job, all) {
   const dependencies = (job.dependsOn || []).map((id) => all.find((j) => j.id === id));
@@ -136,7 +149,7 @@ function resourceBusy(job, all) {
 }
 function waitReason(C, cfg, all, job, external) {
   return dependencyState(job, all) || (resourceBusy(job, all) ? 'workspace resource' : null) ||
-    (!capacity(C, cfg, all, job.kind, external) ? 'host capacity' : null);
+    capacityBlock(C, cfg, all, job.kind, external, job.owner);
 }
 function chooseJob(C, cfg, all, external) {
   const ready = all.filter((j) => j.state === 'queued' && !waitReason(C, cfg, all, j, external));
@@ -211,13 +224,13 @@ async function submitPipeline(C, plan, session, deps = {}) {
   (deps.ensureRunner || (() => ensureRunner(C)))();
   return { id: pipelineId, jobs: prepared.map((j) => ({ id: j.id, state: j.state })) };
 }
-function status(C, id) {
+function status(C, id, deps = {}) {
   const all = jobs(C);
   const pipeline = typeof id === 'string' && /^pipeline_[a-f0-9]{16}$/.test(id);
   const history = readJson(historyFile(C));
   const waiting = all.filter((j) => j.state === 'queued');
   const cfg = config(C);
-  const external = externalBuilds(all);
+  const external = deps.externalBuilds ? deps.externalBuilds() : externalBuilds(all);
   const result = all.filter((j) => !id || (pipeline ? j.pipelineId === id : j.id === id)).map((j) => ({ ...j,
     waitReason: j.state === 'queued' ? waitReason(C, cfg, all, j, external) || 'scheduler turn' : null,
     ...(j.state === 'running' && j.phase === 'command' ? { phase: readJson(path.join(root(C), j.id + '.phase.json'))?.phase || j.phase,
@@ -905,7 +918,7 @@ async function cli(C, argv) {
   if (args.json) console.log(JSON.stringify(result));
   else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
 }
-module.exports = { jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { capacityBlock, jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);

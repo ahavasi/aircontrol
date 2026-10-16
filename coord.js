@@ -2234,8 +2234,11 @@ function acquireDevice(opts, deps = {}) {
   // grab a second device. Hand back the one this session already holds unless it
   // explicitly asked for another.
   if (!extra) {
-    const mine = readLeases().find((l) => l.sessionId === sessionId && (!platform || l.platform === platform));
-    if (mine && !opts.queuedJob && devices.some((d) => d.key === mine.key && d.platform === mine.platform)) {
+    const mine = readLeases().find((l) => l.sessionId === sessionId && (!platform || l.platform === platform) &&
+      (!opts.queuedJob || !l.jobId));
+    // A queued job adopts its owner's manual lease: the scheduler stopped
+    // counting that lease against the job, so the job must run on that device.
+    if (mine && devices.some((d) => d.key === mine.key && d.platform === mine.platform)) {
       const device = devices.find((d) => d.platform === mine.platform && d.key === mine.key) || mine;
       return { ok: true, device, lease: mine, affinity: 'already-held', reused: true };
     }
