@@ -88,7 +88,7 @@ test('eligible jobs bypass simulator waits and batch runs after three interactiv
   assert.equal(Q.chooseJob(C, Q.config(C), Q.jobs(C), 0).id, fast.id);
   Q.atomic(path.join(Q.root(C), 'scheduler.json'), { interactiveStreak: 3 });
   assert.equal(Q.chooseJob(C, Q.config(C), Q.jobs(C), 0).id, batch.id);
-  assert.equal(Q.status(C, blocked.id).waitReason, 'host capacity');
+  assert.match(Q.status(C, blocked.id, { externalBuilds: () => 0 }).waitReason, /^simulator held by .+ \(manual lease\)$/);
 });
 test('pipeline workspace ownership survives gaps between chunks and ends after termination', async () => {
   const session = setup();
@@ -163,6 +163,25 @@ test('manual leases and active jobs consume capacity; outside builds drain first
   assert.equal(Q.capacity(C, cfg, [], 'build', 0), true);
   assert.equal(C.acquireDevice({ sessionId: 'another', platform: 'ios', nowMs: Date.now() }, deps).reason, 'host-capacity');
   assert.equal(C.acquireDevice({ sessionId: 'another', platform: 'android', nowMs: Date.now() }, { ...deps, listAndroid: () => [{ platform: 'android', key: 'test-avd', name: 'test-avd', state: 'shutdown' }] }).ok, true);
+});
+test("a session's own manual lease never blocks its own simulator job", () => {
+  setup({ overlap: true });
+  const cfg = Q.config(C);
+  C.tryLease({ ...device, sessionId: 'queue-owner', sessionName: 'colonel-test', acquiredAt: new Date().toISOString() });
+  assert.equal(Q.capacityBlock(C, cfg, [], 'ios-test', 0, 'queue-owner'), null);
+  assert.equal(Q.capacityBlock(C, cfg, [], 'ios-test', 0, 'someone-else'), 'simulator held by colonel-test (manual lease)');
+  assert.equal(Q.capacityBlock(C, cfg, [], 'ios-test', 1, 'queue-owner'), 'outside xcodebuild running');
+  assert.equal(Q.capacityBlock(C, cfg, [{ state: 'running', kind: 'ios-test' }], 'ios-test', 0, 'queue-owner'), 'host capacity');
+});
+test("a queued job adopts its owner's manual lease instead of waiting on it", () => {
+  setup({ overlap: true });
+  C.tryLease({ ...device, sessionId: 'queue-owner', acquiredAt: new Date().toISOString() });
+  const result = C.acquireDevice({ sessionId: 'queue-owner', platform: 'ios', nowMs: Date.now(), queuedJob: 'test_00000000000000aa' }, deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.device.key, device.key);
+  assert.equal(result.reused, true);
+  const other = C.acquireDevice({ sessionId: 'someone-else', platform: 'ios', nowMs: Date.now(), queuedJob: 'test_00000000000000bb' }, deps);
+  assert.notEqual(other.reused, true);
 });
 test('cancelling queued work requires its owner and never starts it', async () => {
   const session = setup();
