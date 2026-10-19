@@ -573,7 +573,7 @@ ${delivery}
   \`node ${cliPath} release --session <your-name>\`
 - If the roster block is missing, run \`node ${cliPath} who\` and do not assume the room
   is empty. For ${guidanceName}, review and trust the installed hooks before shared-resource work.
-- **Queue Xcode builds and simulator tests when testing is enabled**: submit through the project verification entrypoint or \`node ${cliPath} test submit --session <your-name> --kind ios-test|build -- <argv>\`. Submission returns immediately; \`test status <job-id>\` reports progress. Never release a queued job's simulator manually: cancel the job or wait for cleanup.
+- **Queue Xcode builds and simulator tests when testing is enabled**: submit through the project verification entrypoint or \`node ${cliPath} test submit --session <your-name> --kind ios-test|build -- <argv>\`. Submission returns immediately; \`test status <job-id>\` reports progress. Never release a queued job's simulator manually: cancel the job or wait for cleanup. The queue is simulator-only: a UI test on a physical device runs outside it, and only after \`dsmemberutil checkmembership -U $USER -G _developer\` reports membership, or xcodebuild blocks on a terminal \`Password:\` prompt the user never sees. If a device run still fails, switch to manual device QA instead of retrying.
 - **Never boot a simulator or emulator without leasing it first** — a lease is enforced,
   unlike a claim: \`node ${cliPath} sim acquire --session <your-name> --for "<what you're testing>"\`.
   It returns a **UDID**: use the one from *this* acquire, never one from an earlier lease (a
