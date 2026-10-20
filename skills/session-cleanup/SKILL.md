@@ -136,17 +136,26 @@ no check for who is using it, and `--force` discards uncommitted work.
 ```bash
 node ~/.claude/hooks/coord.js worktrees --others --session <your-name>
 git branch -v | grep '\[gone\]'
+git fetch -q origin && git branch --merged origin/<default>
 ```
 
-For each `[gone]` branch, in this order:
+Candidates are worktrees whose branch is `[gone]` **or already merged into `origin/<default>`**.
+Merged branches are rarely deleted on the remote, so `[gone]` alone misses most finished
+worktrees. For each candidate, in this order:
 
 1. **Held by another live session?** Skip it. Say whose it is.
-2. **`git -C <worktree> status --porcelain` non-empty?** Skip it and report the path. Uncommitted
-   work is someone's unfinished thought, including possibly your own.
+2. **Tracked changes, or untracked files other than regenerable build output?** Skip it and report
+   the path. Uncommitted work is someone's unfinished thought, including possibly your own. An
+   untracked `node_modules`, `build/` or `.gradle/` is not work: delete it, then continue.
 3. Otherwise `git worktree remove <path>` — **without `--force`**. If it refuses, that refusal is
    information; report it rather than escalating.
-4. Only delete a branch whose worktree was actually removed. Never `-D` one that was skipped.
-5. Then reclaim the build output those worktrees and earlier sessions left behind. Xcode never
+4. Only delete a branch whose worktree was actually removed, with `-d`. Never `-D` one that was
+   skipped.
+5. Worktrees that stay but sit idle (no live session, nothing modified in the last few hours) still
+   hold their ignored build output, often several GB each, and `disk --prune` does not look inside
+   registered worktrees. Delete their `.gradle`, `build`, `DerivedData` and `node_modules`
+   directories; they regenerate on the next build.
+6. Then reclaim the build output those worktrees and earlier sessions left behind. Xcode never
    deletes a removed worktree's DerivedData, and macOS keeps ended sessions' `/tmp` dirs until
    reboot (several GB each); nothing else will:
 
