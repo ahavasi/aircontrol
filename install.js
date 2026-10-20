@@ -608,9 +608,9 @@ ${delivery}
   \`git log <target>..<current>\` first for what the move would lose, and
   \`git branch --contains <sha>\` after for each stranded commit. An orphaned one returns empty
   and survives only in the reflog until it is collected.
-- **Before editing an existing surface, \`git fetch\` and diff the target files against
-  \`origin/<default>\`.** Uncommitted local copies may be superseded by merged work; build on the
-  remote version, not the stale one.
+- **Before exploring, planning or editing an existing surface, \`git fetch\` and read it at
+  \`origin/<default>\`.** Uncommitted local copies may be superseded by merged work; plan and build on
+  the remote version, not the stale one.
 - **A \`context:\` line in the block means this session's tool results are getting expensive.**
   It names the costliest one, scored the way \`retro\` scores it (\`bytes x turns re-sent\`) but live
   rather than post-mortem. Two things actually move that number: bound an image result the way
