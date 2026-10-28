@@ -1619,7 +1619,8 @@ function cmdInject(input, nowMs, harness) {
       ledgerLine = renderLedgerLine(ledgerCounts(items, s.repo), path.basename(s.worktree), cliPath);
       const pick = suggestNextLedgerItem(items, s.repo, gitOriginKey(s.worktree));
       if (ledgerLine && pick) {
-        ledgerLine += `\n[aircontrol] suggested next: ${pick.id} "${pick.title}"${pick.priority !== 'normal' ? ` (${pick.priority})` : ''} — \`${cliPath.replace(/^~/, 'node ~')} ledger take ${pick.id}\` before working it`;
+        const pickDates = ledgerDatesLabel(pick, nowMs);
+        ledgerLine += `\n[aircontrol] suggested next: ${pick.id} "${pick.title}"${pick.priority !== 'normal' ? ` (${pick.priority})` : ''}${pickDates ? ` [${pickDates}]` : ''} — \`${cliPath.replace(/^~/, 'node ~')} ledger take ${pick.id}\` before working it`;
       }
     } catch { ledgerLine = ''; }
   }
@@ -2557,6 +2558,48 @@ const LEDGER_STALE_MS = 14 * 24 * 60 * 60 * 1000;
 const LEDGER_TITLE_MAX = 80;
 const LEDGER_STATUSES = new Set(['open', 'blocked-on-human', 'done']);
 const LEDGER_PRIORITY_RANK = { urgent: 3, high: 2, normal: 1, low: 0 };
+const LEDGER_DUE_SOON_DAYS = 3;
+const LEDGER_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Dates are calendar days in the machine's local zone, not instants: "due
+// 2026-11-20" means that day here, so a UTC conversion would flip it a day
+// early or late depending on the hour it is read.
+function localDate(nowMs) {
+  const d = new Date(nowMs);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function daysBetween(fromDate, toDate) {
+  const utc = (v) => { const [y, m, d] = v.split('-').map(Number); return Date.UTC(y, m - 1, d); };
+  return Math.round((utc(toDate) - utc(fromDate)) / 86400000);
+}
+
+function isLedgerDate(v) {
+  if (typeof v !== 'string' || !LEDGER_DATE_RE.test(v)) return false;
+  const [y, m, d] = v.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+// undefined = flag absent (leave as is), null = clear, else a validated date.
+function parseLedgerDateArg(args, key) {
+  const raw = args[key];
+  if (raw === undefined) return undefined;
+  if (raw === 'none' || raw === 'clear' || raw === '') return null;
+  if (!isLedgerDate(raw)) throw new Error(`--${key} must be YYYY-MM-DD (local date) or "none" to clear, got "${raw}"`);
+  return raw;
+}
+
+function ledgerDatesLabel(it, nowMs) {
+  const today = localDate(nowMs);
+  const parts = [];
+  if (it.due) {
+    const n = daysBetween(today, it.due);
+    parts.push(n < 0 ? `⚠ overdue ${-n}d (due ${it.due})` : n === 0 ? `⚠ due today (${it.due})` : `due ${it.due} (in ${n}d)`);
+  }
+  if (it.notBefore && it.notBefore > today) parts.push(`not before ${it.notBefore}`);
+  return parts.join(' · ');
+}
 
 function ledgerFile() { return path.join(dataDir(), 'ledger.jsonl'); }
 
@@ -2600,6 +2643,8 @@ function foldLedger(events) {
         priority: Object.prototype.hasOwnProperty.call(LEDGER_PRIORITY_RANK, e.priority) ? e.priority : 'normal',
         dependsOn: Array.isArray(e.dependsOn) ? e.dependsOn : [],
         repoUrl: e.repoUrl || null,
+        due: isLedgerDate(e.due) ? e.due : null,
+        notBefore: isLedgerDate(e.notBefore) ? e.notBefore : null,
         machine: e._machine || null,
         owner: null,
         opened: e.ts,
@@ -2616,6 +2661,10 @@ function foldLedger(events) {
     else if (e.event === 'drop') it.owner = null;
     else if (e.event === 'note') it.notes.push({ ts: e.ts, text: e.text || '' });
     else if (e.event === 'status') { if (LEDGER_STATUSES.has(e.status)) it.status = e.status; }
+    else if (e.event === 'dates') {
+      if (e.due === null || isLedgerDate(e.due)) it.due = e.due;
+      if (e.notBefore === null || isLedgerDate(e.notBefore)) it.notBefore = e.notBefore;
+    }
     else if (e.event === 'done') {
       it.status = 'done';
       it.owner = null;
@@ -2658,6 +2707,9 @@ function ledgerView(nowMs) {
           : blockedByDeps ? 'blocked-on-deps' : 'open';
     it.staleSince = it.state !== 'done' && nowMs - Date.parse(it.updated || 0) > LEDGER_STALE_MS
       ? it.updated : null;
+    const today = localDate(nowMs);
+    it.dueInDays = it.due ? daysBetween(today, it.due) : null;
+    it.deferred = !!(it.notBefore && it.notBefore > today);
   }
   return items.sort((a, b) => String(a.opened).localeCompare(String(b.opened)));
 }
@@ -2666,13 +2718,22 @@ function ledgerView(nowMs) {
 // deps met and nobody working it. Never another repo's work — a suggestion the
 // session can't act on here is noise. "This repo" matches by local key or, for
 // items logged on another machine, by the normalized origin URL.
+// Items with a not-before date still in the future are invisible to it; anything
+// overdue or due within LEDGER_DUE_SOON_DAYS jumps ahead of priority, soonest first.
+function compareLedgerUrgency(a, b) {
+  const soon = (it) => it.dueInDays !== null && it.dueInDays !== undefined && it.dueInDays <= LEDGER_DUE_SOON_DAYS;
+  const sa = soon(a), sb = soon(b);
+  if (sa !== sb) return sa ? -1 : 1;
+  if (sa && a.dueInDays !== b.dueInDays) return a.dueInDays - b.dueInDays;
+  return (LEDGER_PRIORITY_RANK[b.priority] || 0) - (LEDGER_PRIORITY_RANK[a.priority] || 0) ||
+    String(a.opened).localeCompare(String(b.opened));
+}
+
 function suggestNextLedgerItem(items, repo, repoUrl = null) {
-  const candidates = items.filter((it) => it.state === 'open' &&
+  const candidates = items.filter((it) => it.state === 'open' && !it.deferred &&
     (it.repo === repo || (repoUrl && it.repoUrl === repoUrl)));
   if (!candidates.length) return null;
-  candidates.sort((a, b) =>
-    (LEDGER_PRIORITY_RANK[b.priority] || 0) - (LEDGER_PRIORITY_RANK[a.priority] || 0) ||
-    String(a.opened).localeCompare(String(b.opened)));
+  candidates.sort(compareLedgerUrgency);
   return candidates[0];
 }
 
@@ -2803,7 +2864,8 @@ function formatLedgerItem(it, nowMs, { notes = false } = {}) {
   const last = notes && it.notes.length
     ? it.notes.map((n) => `\n      note: ${n.text}`).join('')
     : '';
-  return `  ${it.id}  ${where}${it.title}${pri}\n      ${badge} · ${it.pointsAt} · opened ${agoLabel(it.opened, nowMs)}${stale}${last}`;
+  const dates = ledgerDatesLabel(it, nowMs);
+  return `  ${it.id}  ${where}${it.title}${pri}\n      ${badge} · ${it.pointsAt}${dates ? ` · ${dates}` : ''} · opened ${agoLabel(it.opened, nowMs)}${stale}${last}`;
 }
 
 function cmdLedger(args, nowMs, hooks = {}) {
@@ -2828,14 +2890,17 @@ function cmdLedger(args, nowMs, hooks = {}) {
       throw new Error(`unknown --priority "${priority}" (${Object.keys(LEDGER_PRIORITY_RANK).join('|')})`);
     }
     const dependsOn = splitList(args['depends-on'] || args.dependsOn);
+    const due = parseLedgerDateArg(args, 'due') || null;
+    const notBefore = parseLedgerDateArg(args, 'not-before') || null;
     const g = gitInfo(process.cwd());
     const ts = new Date(nowMs).toISOString();
     const id = ledgerId(`${ts}${title}${g.repo}`, foldLedger(readLedgerEvents()));
     appendLedgerEvent({
       ts, event: 'add', id, repo: g.repo, repoName: path.basename(g.worktree), title, pointsAt, status, priority, dependsOn,
+      ...(due ? { due } : {}), ...(notBefore ? { notBefore } : {}),
       repoUrl: gitOriginKey(process.cwd()),
     });
-    console.log(`added ${id}: ${title} → ${pointsAt} (${status}${priority !== 'normal' ? `, ${priority}` : ''}${dependsOn.length ? `, after ${dependsOn.join(',')}` : ''})`);
+    console.log(`added ${id}: ${title} → ${pointsAt} (${status}${priority !== 'normal' ? `, ${priority}` : ''}${dependsOn.length ? `, after ${dependsOn.join(',')}` : ''}${due ? `, due ${due}` : ''}${notBefore ? `, not before ${notBefore}` : ''})`);
     return;
   }
 
@@ -2894,11 +2959,21 @@ function cmdLedger(args, nowMs, hooks = {}) {
     return;
   }
 
-  if (sub === 'note') {
-    const text = args._.slice(3).join(' ').trim();
-    if (!text) throw new Error('ledger note needs text');
-    appendLedgerEvent({ ts, event: 'note', id, text });
-    console.log(`noted on ${id}`);
+  if (sub === 'note' || sub === 'dates') {
+    const text = sub === 'note' ? args._.slice(3).join(' ').trim() : '';
+    const due = parseLedgerDateArg(args, 'due');
+    const notBefore = parseLedgerDateArg(args, 'not-before');
+    const hasDates = due !== undefined || notBefore !== undefined;
+    if (!text && !hasDates) throw new Error(`ledger ${sub} needs ${sub === 'note' ? 'text or ' : ''}--due/--not-before`);
+    if (hasDates) {
+      appendLedgerEvent({
+        ts, event: 'dates', id,
+        ...(due !== undefined ? { due } : {}), ...(notBefore !== undefined ? { notBefore } : {}),
+      });
+    }
+    if (text) appendLedgerEvent({ ts, event: 'note', id, text });
+    const changed = [due !== undefined && `due ${due || 'cleared'}`, notBefore !== undefined && `not-before ${notBefore || 'cleared'}`].filter(Boolean);
+    console.log(`${text ? 'noted on' : 'updated'} ${id}${changed.length ? ` (${changed.join(', ')})` : ''}`);
     return;
   }
 
@@ -2921,7 +2996,7 @@ function cmdLedger(args, nowMs, hooks = {}) {
     return;
   }
 
-  throw new Error('usage: coord.js ledger <add|list|show|take|drop|note|block|unblock|done> …');
+  throw new Error('usage: coord.js ledger <add|list|show|take|drop|note|dates|block|unblock|done> …');
 }
 
 // ---------- session-scoped cleanup ----------
@@ -5298,7 +5373,7 @@ module.exports = {
   budgetThresholds, renderBudgetLine, sessionTranscript, humanBytes,
   BUDGET_DEFAULTS, BUDGET_TOP_N, BUDGET_POOL, BUDGET_PENDING_MAX,
   ledgerFile, readLedgerEvents, appendLedgerEvent, ledgerId, foldLedger, ledgerView,
-  suggestNextLedgerItem, cmdHandoff, LEDGER_STALE_MS,
+  suggestNextLedgerItem, compareLedgerUrgency, localDate, cmdHandoff, LEDGER_STALE_MS,
   cmdCloud, codexTaskRecord, parseClaudeCloudId, renderCloudLine, maybeAutoCloudSync, sendToCloud, cloudConfig,
   CLOUD_CODEX, CLOUD_CLAUDE,
   relayConfig, relaySync, relaySyncQuiet, relayClaim, remoteClaimants, relayRosterSessions, maybeAutoRelaySync, cmdRelay,
