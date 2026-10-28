@@ -5317,7 +5317,7 @@ function main() {
       console.error('       coord.js skills <status|link|unlink> [--repo path|--global] [--targets agents,grok] [--dry-run] [--json] — mirror .claude/skills into the dirs other harnesses read');
       console.error('       coord.js sim <list|acquire|release> [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
       console.error('       coord.js device install <path/to/App.app> [--udid UDID] [--launch bundleId] [--timeout-min 30] — install on a paired iPhone, waiting while it is locked or unplugged');
-      console.error('       coord.js ledger <add|list|show|take|note|block|unblock|done|drop> [--repo .|all|path] [--title "…"] [--points-at ref] [--status …] [--priority low|normal|high|urgent] [--depends-on id1,id2] [--mine] [--notes] — list omits notes; show <id> prints them');
+      console.error('       coord.js ledger <add|list|show|take|note|dates|block|unblock|done|drop> [--repo .|all|path] [--title "…"] [--points-at ref] [--status …] [--priority low|normal|high|urgent] [--depends-on id1,id2] [--due YYYY-MM-DD|none] [--not-before YYYY-MM-DD|none] [--mine] [--notes] — list omits notes; show <id> prints them');
       console.error('       coord.js test <submit|status|list|line|watch|cancel> [--json] — list shows the whole queue; line --session <name> prints the status-line segment');
       console.error('       coord.js dashboard [--port 7788] [--open] — local live view (a cmux browser split when run inside cmux) of the queue, verify runs and simulators');
       console.error('       coord.js handoff --session <me> --to <them> [--ledger-id id] [--note "context for the recipient"]');
