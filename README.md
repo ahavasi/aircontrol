@@ -456,6 +456,13 @@ node ~/.claude/hooks/coord.js ledger take lg_7f2c1a --session captain-boopsnoot
   the queue; `--depends-on id1,id2` derives a `blocked-on-deps` state until every dep is done
   (a dep compacted away counts as met). Items untouched for 14 days are flagged
   `⚠ stale` in `ledger list`.
+- **Dates are first-class too.** `--due YYYY-MM-DD` is a deadline and `--not-before YYYY-MM-DD`
+  an earliest start, both local calendar days, on `ledger add` or later with
+  `ledger dates <id> --due … --not-before …` (or on `ledger note`); `none` clears one. An item
+  whose not-before is still ahead is never suggested; anything overdue or due within 3 days is
+  suggested ahead of priority, soonest first. `ledger list` shows `due … (in Nd)`,
+  `⚠ overdue Nd` and `not before …`, and `--json` carries `due`, `notBefore`, `dueInDays` and
+  `deferred`. Keep deadlines out of titles.
 - **`ledger list` leaves the notes out.** Notes run to paragraphs and a machine can carry
   dozens of open items, so the default listing is one item per two lines: title, pointer,
   state, age. The pointer stays because it is how `take` finds the spec. `--notes` prints
@@ -463,7 +470,8 @@ node ~/.claude/hooks/coord.js ledger take lg_7f2c1a --session captain-boopsnoot
   an agent re-sends every tool result on every later turn, and on 2026-09-12 a single
   `ledger list` was the most expensive result of an entire session.
 - **Each session gets one suggestion.** The once-per-session ledger notice appends the
-  highest-priority open item *in this repo* with deps met and no owner — so a fresh session
+  most urgent open item *in this repo* (overdue or due soon first, then priority) with deps met,
+  no owner and no future not-before date — so a fresh session
   knows what to pick up without asking.
 - **Three skills work it.** `ledger-next` triages or works one item. `next-steps` ranks
   everything outstanding and asks which to take. `ledger-drain` works through every item an

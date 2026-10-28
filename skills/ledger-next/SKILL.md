@@ -79,6 +79,7 @@ Group items by what would answer them, then run one command per group:
 ledger done  <id> --note "<evidence: sha / file:line / query result>"   # verified finished
 ledger block <id>                                                       # needs a human
 ledger note  <id> <text>                                                # new facts, still open
+ledger dates <id> --due YYYY-MM-DD --not-before YYYY-MM-DD|none         # deadline / earliest start
 ledger drop  <id>                                                       # hand back ownership
 ```
 
@@ -99,8 +100,9 @@ after a 30-day TTL (`LEDGER_DONE_TTL_MS`, `coord.js`). When in doubt, `note` and
 **1. Pick.**
 
 Honor the injected `suggested next` if the prompt carries one. Otherwise re-derive its rule
-(`suggestNextLedgerItem` in `coord.js`): `state === 'open'`, **this repo only**, highest `priority`,
-then oldest `opened`. Skip anything only a human can do — that gets `block`, not an attempt.
+(`suggestNextLedgerItem` in `coord.js`): `state === 'open'`, **this repo only**, not `deferred` (a
+`notBefore` still in the future), then overdue or due within 3 days first (soonest `due` first),
+then highest `priority`, then oldest `opened`. Skip anything only a human can do — that gets `block`, not an attempt.
 
 **2. `take` it FIRST, before reading anything.**
 
@@ -159,7 +161,8 @@ When you defer something, log it rather than leaving it in a file nobody will fi
 
 ```bash
 node ~/.claude/hooks/coord.js ledger add --title "<80 chars max>" \
-  --points-at <spec|plan|PR|memory|file:line> [--priority high] [--depends-on lg_a,lg_b]
+  --points-at <spec|plan|PR|memory|file:line> [--priority high] [--depends-on lg_a,lg_b] \
+  [--due YYYY-MM-DD] [--not-before YYYY-MM-DD]
 ```
 
 `--points-at` is mandatory and `--title` is capped at 80 characters — both on purpose. Detail lives

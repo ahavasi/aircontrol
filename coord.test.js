@@ -4199,3 +4199,78 @@ test('device install auto-picks the single paired iPhone and errors on zero or s
   const none = deviceStub({ devices: [], install: [] });
   await assert.rejects(C.installOnDevice({ app: 'A.app' }, deviceDeps(none)), /no paired iPhones/);
 });
+
+test('ledger due and not-before dates are stored, changed, cleared, and validated', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('led-dates');
+  const now = Date.parse('2026-10-28T12:00:00');
+  C.cmdRegister({ session_id: 'worker-1', cwd: repo }, now);
+  const id = withCwd(repo, () => {
+    captureStdout(() => C.cmdLedger({ _: ['ledger', 'add'], title: 'Ship it', 'points-at': 'p', due: '2026-11-20', 'not-before': '2026-11-01' }, now));
+    assert.throws(() => C.cmdLedger({ _: ['ledger', 'add'], title: 'Bad', 'points-at': 'p', due: '2026-02-30' }, now), /YYYY-MM-DD/);
+    assert.throws(() => C.cmdLedger({ _: ['ledger', 'add'], title: 'Bad', 'points-at': 'p', 'not-before': 'next week' }, now), /YYYY-MM-DD/);
+    return C.ledgerView(now)[0].id;
+  });
+  let it = C.ledgerView(now).find((x) => x.id === id);
+  assert.equal(it.due, '2026-11-20');
+  assert.equal(it.notBefore, '2026-11-01');
+  assert.equal(it.dueInDays, 23);
+  assert.equal(it.deferred, true);
+  const listed = captureStdout(() => C.cmdLedger({ _: ['ledger', 'list'], repo: 'all' }, now));
+  assert.match(listed, /due 2026-11-20 \(in 23d\)/);
+  assert.match(listed, /not before 2026-11-01/);
+  const json = JSON.parse(captureStdout(() => C.cmdLedger({ _: ['ledger', 'list'], repo: 'all', json: true }, now)));
+  assert.equal(json[0].due, '2026-11-20');
+  assert.equal(json[0].notBefore, '2026-11-01');
+
+  captureStdout(() => C.cmdLedger({ _: ['ledger', 'note', id, 'moved', 'up'], due: '2026-10-27' }, now + 1));
+  it = C.ledgerView(now + 2).find((x) => x.id === id);
+  assert.equal(it.due, '2026-10-27');
+  assert.equal(it.notBefore, '2026-11-01'); // untouched when its flag is absent
+  assert.equal(it.notes.at(-1).text, 'moved up');
+  assert.match(captureStdout(() => C.cmdLedger({ _: ['ledger', 'show', id] }, now + 2)), /⚠ overdue 1d \(due 2026-10-27\)/);
+
+  captureStdout(() => C.cmdLedger({ _: ['ledger', 'dates', id], 'not-before': 'none' }, now + 3));
+  it = C.ledgerView(now + 4).find((x) => x.id === id);
+  assert.equal(it.notBefore, null);
+  assert.equal(it.deferred, false);
+  assert.equal(it.notes.length, 1); // `dates` adds no note
+  assert.throws(() => C.cmdLedger({ _: ['ledger', 'dates', id] }, now + 5), /--due/);
+  assert.throws(() => C.cmdLedger({ _: ['ledger', 'note', id] }, now + 5), /text or --due/);
+});
+
+test('ledger suggestion skips not-before items and puts overdue and due-soon ahead of priority', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('led-dates-rank');
+  const now = Date.parse('2026-10-28T12:00:00');
+  C.cmdRegister({ session_id: 'worker-1', cwd: repo }, now);
+  const repoKey = C.readSession('worker-1').repo;
+  const add = (title, extra, t) => withCwd(repo, () =>
+    captureStdout(() => C.cmdLedger({ _: ['ledger', 'add'], title, 'points-at': 'p', ...extra }, t)));
+  add('Later urgent', { priority: 'urgent', 'not-before': '2026-10-29' }, now);
+  add('Plain high', { priority: 'high' }, now + 1);
+  add('Due far low', { priority: 'low', due: '2026-12-01' }, now + 2);
+  add('Due in 3 days', { priority: 'low', due: '2026-10-31' }, now + 3);
+  let items = C.ledgerView(now + 10);
+  assert.equal(C.suggestNextLedgerItem(items, repoKey).title, 'Due in 3 days');
+  add('Overdue', { due: '2026-10-20' }, now + 4);
+  items = C.ledgerView(now + 10);
+  assert.equal(C.suggestNextLedgerItem(items, repoKey).title, 'Overdue');
+  const rest = items.filter((it) => !it.deferred).sort(C.compareLedgerUrgency).map((it) => it.title);
+  assert.deepEqual(rest, ['Overdue', 'Due in 3 days', 'Plain high', 'Due far low']);
+  // A day later the not-before has arrived; its urgency now outranks plain high, not the due-soon pair.
+  const tomorrow = Date.parse('2026-10-29T09:00:00');
+  items = C.ledgerView(tomorrow);
+  assert.equal(items.find((it) => it.title === 'Later urgent').deferred, false);
+  assert.deepEqual(items.sort(C.compareLedgerUrgency).map((it) => it.title).slice(0, 3), ['Overdue', 'Due in 3 days', 'Later urgent']);
+});
+
+test('the session suggestion line names the due date', () => {
+  freshDataDir();
+  const repo = tmpGitRepo('led-dates-line');
+  const now = Date.parse('2026-10-28T12:00:00');
+  withCwd(repo, () => captureStdout(() => C.cmdLedger({ _: ['ledger', 'add'], title: 'Deadline thing', 'points-at': 'p', due: '2026-10-28' }, now)));
+  C.cmdRegister({ session_id: 'worker-1', cwd: repo }, now);
+  const out = injectContext({ session_id: 'worker-1', cwd: repo }, now);
+  assert.match(out, /suggested next: lg_\w+ "Deadline thing" \[⚠ due today \(2026-10-28\)\]/);
+});

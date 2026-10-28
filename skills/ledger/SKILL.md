@@ -76,8 +76,12 @@ free to pick up.
 node ~/.claude/hooks/coord.js ledger add \
   --title "one line, under 80 chars" \
   --points-at <spec|plan|PR url|memory file> \
-  [--priority urgent|high|normal|low] [--status open|blocked-on-human]
+  [--priority urgent|high|normal|low] [--status open|blocked-on-human] \
+  [--due YYYY-MM-DD] [--not-before YYYY-MM-DD]
 ```
+
+A deadline goes in `--due`, an earliest start in `--not-before` (local calendar days), never in the
+title. Change or clear them later with `ledger dates <id> --due 2026-11-20 --not-before none`.
 
 `--points-at` is **required** and `--title` is capped at 80 characters, both on purpose: the ledger
 is an index. Put the reasoning in the thing it points at, or in a `note` afterwards, not in the
