@@ -579,6 +579,8 @@ ${delivery}
   It returns a **UDID**: use the one from *this* acquire, never one from an earlier lease (a
   name-based \`-destination\` silently runs zero tests). It prefers the
   device that already has that app's data installed. \`sim list\` shows who holds what.
+  Gate every later step on the grant (\`… sim acquire … | grep -q '^leased' || exit 1\`):
+  a denial prints \`DENIED\` and the next chained command still runs.
 - **Release the device when you are done with it, not at some later cleanup** —
   \`node ${cliPath} sim release --session <your-name>\` shuts it down and hands it back in one
   step (\`--keep-booted\` opts out for a handoff). A real session end does the same for anything
