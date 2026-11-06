@@ -1329,6 +1329,10 @@ test('deploy scopes: claim matching, target overlap, and per-command classificat
   assert.deepEqual(C.commandDeployScopes('bundle exec fastlane supply'), ['play']);
   // the specific fastlane rule wins over the catch-all rather than both firing
   assert.deepEqual(C.commandDeployScopes('fastlane upload_to_app_store'), ['asc']);
+  // a metadata lane ships to App Store Connect too, so it must not fall to the
+  // machine-wide catch-all and wait on every other deploy on the host
+  assert.deepEqual(C.commandDeployScopes('bundle exec fastlane upload_metadata skip_screenshots:true'), ['asc']);
+  assert.deepEqual(C.commandDeployScopes('fastlane ios metadata'), ['asc']);
   // a lane whose target is only knowable from its config stays machine-wide
   assert.deepEqual(C.commandDeployScopes('bundle exec fastlane beta'), [null]);
   assert.deepEqual(C.commandDeployScopes('npm run deploy'), [null]);
