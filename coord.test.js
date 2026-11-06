@@ -1333,6 +1333,12 @@ test('deploy scopes: claim matching, target overlap, and per-command classificat
   // machine-wide catch-all and wait on every other deploy on the host
   assert.deepEqual(C.commandDeployScopes('bundle exec fastlane upload_metadata skip_screenshots:true'), ['asc']);
   assert.deepEqual(C.commandDeployScopes('fastlane ios metadata'), ['asc']);
+  // the same lane under the android platform ships to Play, never App Store Connect
+  assert.deepEqual(C.commandDeployScopes('bundle exec fastlane android upload_metadata'), ['play']);
+  assert.deepEqual(C.commandDeployScopes('fastlane play_metadata'), ['play']);
+  // a platform word alone is not a deploy, and one before an ambiguous lane keeps the catch-all
+  assert.deepEqual(C.commandDeployScopes('fastlane android build'), []);
+  assert.deepEqual(C.commandDeployScopes('fastlane ios beta'), [null]);
   // a lane whose target is only knowable from its config stays machine-wide
   assert.deepEqual(C.commandDeployScopes('bundle exec fastlane beta'), [null]);
   assert.deepEqual(C.commandDeployScopes('npm run deploy'), [null]);

@@ -1186,9 +1186,9 @@ const STASH_READONLY_SUBS = new Set(['list', 'show', 'branch']);
 const DEPLOY_PATTERNS = [
   { family: 'firebase', re: /\bfirebase\s+deploy\b/, scope: 'firebase' },
   { family: 'wrangler', re: /\bwrangler\s+(?:deploy|publish)\b/, scope: 'cloudflare' },
-  { family: 'fastlane', re: /\bfastlane\s+(?:\w+\s+)?\w*(?:deliver|pilot|testflight|app_store|metadata)\w*/, scope: 'asc' },
-  { family: 'fastlane', re: /\bfastlane\s+\w*(?:supply|play_store)\w*/, scope: 'play' },
-  { family: 'fastlane', re: /\bfastlane\s+\w*(?:upload|release|deploy|beta)\w*/, scope: null },
+  { family: 'fastlane', re: /\bfastlane\s+(?:android\s+\w*(?:upload|release|deploy|beta|metadata|supply|play)\w*|\w*(?:supply|play_store|play)\w*)/, scope: 'play' },
+  { family: 'fastlane', re: /\bfastlane\s+(?:(?!android)\w+\s+)?\w*(?:deliver|pilot|testflight|app_store|metadata)\w*/, scope: 'asc' },
+  { family: 'fastlane', re: /\bfastlane\s+(?:\w+\s+)?\w*(?:upload|release|deploy|beta)\w*/, scope: null },
   { family: 'eas', re: /\beas\s+submit\b/, scope: null },
   { family: 'npm', re: /\bnpm\s+run\s+deploy\b/, scope: null },
 ];
