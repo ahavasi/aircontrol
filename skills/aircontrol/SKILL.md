@@ -42,6 +42,7 @@ session-id prefix.
 - If the roster block is missing, run `node ~/.claude/hooks/coord.js who` and do not assume the room
   is empty. For Claude Code, review and trust the installed hooks before shared-resource work.
 - **Queue Xcode builds and simulator tests when testing is enabled**: submit through the project verification entrypoint or `node ~/.claude/hooks/coord.js test submit --session <your-name> --kind ios-test|build -- <argv>`. Submission returns immediately; `test status <job-id>` reports progress. Never release a queued job's simulator manually: cancel the job or wait for cleanup. The queue is simulator-only: a UI test on a physical device runs outside it, and only after `dsmemberutil checkmembership -U $USER -G _developer` reports membership, or xcodebuild blocks on a terminal `Password:` prompt the user never sees. If a device run still fails, switch to manual device QA instead of retrying.
+- **An `unhealthy sim <name>` warning** means a queued boot hung twice; the queue now skips that device. Once nobody holds it, `node ~/.claude/hooks/coord.js sim reset <name>` shuts it down, erases it and returns it to the pool. Never boot or erase it by hand.
 - **Never boot a simulator or emulator without leasing it first** — a lease is enforced,
   unlike a claim: `node ~/.claude/hooks/coord.js sim acquire --session <your-name> --for "<what you're testing>"`.
   It returns a **UDID**: use the one from *this* acquire, never one from an earlier lease (a
