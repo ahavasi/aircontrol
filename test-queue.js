@@ -7,7 +7,7 @@ const os = require('os');
 
 const ACTIVE = new Set(['starting', 'running', 'cleaning']);
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'blocked']);
-const DEFAULTS = { enabled: false, overlap: false, maxXcode: 1, maxSimulators: 1, jobs: 4, jobsSolo: null, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'] };
+const DEFAULTS = { enabled: false, overlap: false, maxXcode: 1, maxSimulators: 1, jobs: 4, jobsSolo: null, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'], bootTimeoutMs: 5 * 60 * 1000 };
 const simulatorJob = (kind) => ['ios-test', 'ios-test-only'].includes(kind);
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const root = (C) => path.join(path.dirname(C.configFile()), 'test-jobs');
@@ -25,7 +25,7 @@ function atomic(name, value) {
 function config(C) {
   const result = { ...DEFAULTS, ...(readJson(C.configFile()) || {}).testing };
   if (typeof result.overlap !== 'boolean') throw new Error('testing.overlap must be boolean');
-  for (const key of ['maxXcode', 'maxSimulators', 'jobs']) {
+  for (const key of ['maxXcode', 'maxSimulators', 'jobs', 'bootTimeoutMs']) {
     if (!Number.isInteger(result[key]) || result[key] < 1) throw new Error('testing.' + key + ' must be a positive integer');
   }
   if (result.jobsSolo === null || result.jobsSolo === undefined) result.jobsSolo = Math.max(result.jobs, os.cpus().length - 2);
@@ -98,6 +98,31 @@ function deviceAllowed(device, cfg, opts = {}) {
     cfg.allowedNames.includes(device.name) && !cfg.protectedDevices.some((s) => s === device.key || s === device.name) &&
     (!opts.name || device.name === opts.name);
 }
+// A pool device whose boot hung twice is benched until an operator resets it: assigning it
+// again would park the next job in the same hang.
+const unhealthyFile = (C) => path.join(root(C), 'unhealthy.json');
+function unhealthyDevices(C) {
+  const all = readJson(unhealthyFile(C));
+  return all && typeof all === 'object' && !Array.isArray(all) ? all : {};
+}
+async function markUnhealthy(C, device, detail) {
+  const write = () => atomic(unhealthyFile(C), { ...unhealthyDevices(C),
+    [device.key]: { key: device.key, name: device.name, runtime: device.runtime || null, at: Date.now(), ...detail } });
+  // Losing a lock race must not lose the mark: an unmarked hung device is handed straight back out.
+  try { await withLock(C, write); } catch { write(); }
+}
+function clearUnhealthy(C, key) {
+  const all = unhealthyDevices(C);
+  if (!all[key]) return false;
+  delete all[key];
+  atomic(unhealthyFile(C), all);
+  return true;
+}
+function poolUnhealthy(C, cfg, job) {
+  const benched = new Set(Object.values(unhealthyDevices(C)).filter((d) => !job.runtime || !d.runtime || d.runtime === job.runtime).map((d) => d.name));
+  const pool = cfg.allowedNames.filter((n) => !job.name || n === job.name);
+  return pool.length && pool.every((n) => benched.has(n)) ? pool : null;
+}
 function activeLease(C, lease) {
   if (!lease.jobId) return false;
   const job = readJson(file(C, lease.jobId));
@@ -148,7 +173,9 @@ function resourceBusy(job, all) {
   });
 }
 function waitReason(C, cfg, all, job, external) {
+  const benched = simulatorJob(job.kind) ? poolUnhealthy(C, cfg, job) : null;
   return dependencyState(job, all) || (resourceBusy(job, all) ? 'workspace resource' : null) ||
+    (benched ? `simulator ${benched.join(', ')} unhealthy; run coord.js sim reset ${benched[0]}` : null) ||
     capacityBlock(C, cfg, all, job.kind, external, job.owner);
 }
 function chooseJob(C, cfg, all, external) {
@@ -492,10 +519,12 @@ async function watch(C, id, opts = {}) {
     await delay(interval);
   }
 }
-function renderTestsLine(all, selfId, now = Date.now()) {
+function renderTestsLine(all, selfId, now = Date.now(), unhealthy = {}) {
   const active = all.filter((j) => ACTIVE.has(j.state));
   const queued = all.filter((j) => j.state === 'queued');
-  if (!active.length && !queued.length) return '';
+  const benched = Object.values(unhealthy).map((d) => d.name);
+  const sick = benched.length ? ` | ⚠️ unhealthy sim ${benched.join(', ')}: \`coord.js sim reset ${benched[0]}\`` : '';
+  if (!active.length && !queued.length) return sick ? `[aircontrol] tests:${sick.slice(2)}` : '';
   const mine = (j) => j.owner === selfId;
   const shown = [...active, ...queued.filter(mine)].sort((a, b) => Number(mine(b)) - Number(mine(a)) || a.sequence - b.sequence).slice(0, 3);
   const items = shown.map((j) => {
@@ -506,17 +535,50 @@ function renderTestsLine(all, selfId, now = Date.now()) {
   });
   const others = queued.filter((j) => !mine(j)).length;
   if (others) items.push(`${others} other job${others === 1 ? '' : 's'} queued`);
-  return `[aircontrol] tests: ${items.join(' | ')} — \`coord.js test watch <id>\` to follow`;
+  return `[aircontrol] tests: ${items.join(' | ')} — \`coord.js test watch <id>\` to follow${sick}`;
 }
 
-async function execute(argv, job, env, logFd) {
+async function execute(argv, job, env, logFd, timeoutMs) {
   await new Promise((resolve, reject) => {
     const child = spawn(argv[0], argv.slice(1), { cwd: job.cwd, env, stdio: ['ignore', logFd, logFd] });
-    child.on('error', reject);
-    child.on('exit', (code, signal) => code === 0 ? resolve() : reject(new Error('command exited ' + (signal || code))));
+    let timedOut = false;
+    const timer = timeoutMs ? setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, Math.max(1, timeoutMs)) : null;
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut) { const e = new Error(path.basename(argv[0]) + ' ' + argv.slice(1, 3).join(' ') + ' timed out'); e.code = 'AIRCONTROL_TIMEOUT'; return reject(e); }
+      code === 0 ? resolve() : reject(new Error('command exited ' + (signal || code)));
+    });
   });
 }
-async function work(C, id) {
+// `simctl bootstatus -b` can sleep forever on a device simctl already lists as Booted (seen
+// after a data wipe), so each attempt gets a deadline, and a hung attempt is shut down and
+// retried once from cold before the device is benched.
+async function bootDevice(C, job, env, logFd, deps = {}) {
+  const run = deps.execute || execute;
+  const xcrun = deps.xcrun || ['xcrun'];
+  const limit = deps.bootTimeoutMs || config(C).bootTimeoutMs;
+  const note = (text) => { try { fs.writeSync(logFd, '[aircontrol] ' + text + '\n'); } catch {} };
+  const attempt = async (booted) => {
+    const deadline = Date.now() + limit;
+    if (!booted) await run([...xcrun, 'simctl', 'boot', job.device.key], job, env, logFd, limit);
+    await run([...xcrun, 'simctl', 'bootstatus', job.device.key, '-b'], job, env, logFd, Math.max(1, deadline - Date.now()));
+  };
+  for (let n = 1; ; n++) {
+    try { await attempt(n === 1 && job.device.state === 'booted'); return; } catch (e) {
+      if (e.code !== 'AIRCONTROL_TIMEOUT') throw e;
+      note(`boot attempt ${n} on ${job.device.name} (${job.device.key}) did not finish within ${formatDuration(limit)}; shutting it down`);
+      try { await run([...xcrun, 'simctl', 'shutdown', job.device.key], job, env, logFd, 60000); } catch {}
+      if (n >= 2) break;
+      job.bootRetries = n; atomic(file(C, job.id), job);
+    }
+  }
+  await markUnhealthy(C, job.device, { jobId: job.id, reason: `boot did not finish within ${formatDuration(limit)} twice` });
+  const error = new Error(`simulator ${job.device.name} did not finish booting (twice within ${formatDuration(limit)}); marked unhealthy, clear with \`coord.js sim reset ${job.device.name}\``);
+  error.code = 'AIRCONTROL_BOOT_HUNG';
+  throw error;
+}
+async function work(C, id, deps = {}) {
   let job;
   // The dispatcher writes the process identity before execution may begin.
   for (let i = 0; i < 100; i++) {
@@ -536,14 +598,13 @@ async function work(C, id) {
   try {
     if (job.device) {
       const begin = Date.now();
-      if (job.device.state !== 'booted') await execute(['xcrun', 'simctl', 'boot', job.device.key], job, env, logFd);
-      await execute(['xcrun', 'simctl', 'bootstatus', job.device.key, '-b'], job, env, logFd);
+      await bootDevice(C, job, env, logFd, deps);
       job.timings.bootMs = Date.now() - begin;
     }
     const begin = Date.now();
     job.phase = 'command'; job.commandStartedAt = begin; atomic(file(C, id), job);
     tracker = trackProgress(job.log, path.join(root(C), id + '.progress.json'), env.AIRCONTROL_TEST_PHASE_PATH);
-    await execute(commandForJob(job.command, job, config(C), jobCount), job, env, logFd);
+    await (deps.execute || execute)(commandForJob(job.command, job, config(C), jobCount), job, env, logFd);
     job.timings.commandMs = Date.now() - begin;
     job.result = 'succeeded';
   } catch (e) { job.result = 'failed'; job.error = e.message; }
@@ -586,7 +647,8 @@ function cleanup(C, job, deps = {}) {
     const lease = C.readLease('ios', job.device.key);
     if (lease && lease.jobId !== job.id) { job.error = 'device lease owner changed; cleanup blocked'; atomic(file(C, job.id), job); return false; }
     const result = C.shutdownLeaseDevice(job.device, deps);
-    if (!result.ok) { job.error = 'cleanup pending: ' + result.error; atomic(file(C, job.id), job); return false; }
+    // A benched device is never assigned again, so a failed shutdown must not hold the lane.
+    if (!result.ok && !unhealthyDevices(C)[job.device.key]) { job.error = 'cleanup pending: ' + result.error; atomic(file(C, job.id), job); return false; }
     if (lease) C.releaseLease('ios', job.device.key);
   }
   job.timings.cleanupMs = Date.now() - begin;
@@ -622,6 +684,7 @@ async function tick(C, deps = {}) {
       const result = C.acquireDevice({ sessionId: job.owner, sessionName: job.ownerName, repo: job.repo, purpose: job.id,
         platform: 'ios', nowMs: Date.now(), bundleId: job.bundleId, prefer: job.name, runtime: job.runtime, queuedJob: job.id }, deps);
       if (!result.ok) {
+        // 'unhealthy' means every matching device is benched: wait for a reset, do not fail.
         job.state = result.reason === 'no-devices' ? 'failed' : 'queued';
         if (job.state === 'failed') { job.finishedAt = Date.now(); job.error = 'no compatible allowed agent device'; }
         atomic(file(C, job.id), job); return;
@@ -756,15 +819,17 @@ function snapshot(C, deps = {}) {
   }
   const leases = (deps.readLeases || C.readLeases)().filter((l) => l.platform === 'ios');
   const listed = deps.devices || (deps.listDevices || C.listDevices)('ios', deps);
-  const devices = listed.filter((d) => deviceAllowed(d, cfg) || leases.some((l) => l.key === d.key)).map((d) => {
+  const benched = unhealthyDevices(C);
+  const devices = listed.filter((d) => deviceAllowed(d, cfg) || leases.some((l) => l.key === d.key) || benched[d.key]).map((d) => {
     const lease = leases.find((l) => l.key === d.key);
     return { name: d.name, key: d.key, runtime: d.runtime, state: d.state, holder: lease ? lease.sessionName || C.friendlyName(lease.sessionId) : null,
-      jobId: lease?.jobId || null, purpose: lease?.purpose || null };
+      jobId: lease?.jobId || null, purpose: lease?.purpose || null, unhealthy: benched[d.key] || null };
   });
   const outlook = forecast(cfg, all, records, now);
   for (const j of all) if (outlook.jobs[j.id]) Object.assign(j, outlook.jobs[j.id]);
   const { jobs: _perJob, ...queue } = outlook;
-  return { at: now, config: { enabled: cfg.enabled, overlap: cfg.overlap, maxXcode: cfg.maxXcode, maxSimulators: cfg.maxSimulators }, jobs: all, pipelines, devices, forecast: queue };
+  return { at: now, config: { enabled: cfg.enabled, overlap: cfg.overlap, maxXcode: cfg.maxXcode, maxSimulators: cfg.maxSimulators, bootTimeoutMs: cfg.bootTimeoutMs },
+    jobs: all, pipelines, devices, unhealthy: Object.values(benched), forecast: queue };
 }
 // The status line redraws every second; it reads this file instead of spawning node.
 function statuslineSummary(C, all, now = Date.now()) {
@@ -791,7 +856,8 @@ function renderStatusSegment(summary, ownerName, now = Date.now()) {
   return '🧪 ' + parts.join(' · ');
 }
 function renderList(snap) {
-  if (!snap.jobs.length) return 'queue empty';
+  const sick = (snap.unhealthy || []).map((d) => `unhealthy: ${d.name} (${d.key}) ${d.reason || ''}${d.jobId ? ' · ' + d.jobId : ''} — clear with coord.js sim reset ${d.name}`);
+  if (!snap.jobs.length) return [...sick, 'queue empty'].join('\n');
   const lines = snap.jobs.map((j) => [j.id, j.state.padEnd(9), (j.state === 'queued' ? '#' + j.queuePosition : j.phaseLabel).padEnd(18),
     j.ownerName.padEnd(22), j.label.padEnd(28), j.worktree || '-', j.progressText ? '· ' + j.progressText : '',
     j.state === 'queued' && j.startsInMs !== undefined ? '· starts ~' + formatDuration(j.startsInMs) : ''].join(' '));
@@ -799,7 +865,7 @@ function renderList(snap) {
     lines.push(`queue drains in ~${formatDuration(snap.forecast.drainMs)} (${new Date(snap.forecast.finishAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` +
       (snap.forecast.unknownEstimates ? ` · ${snap.forecast.unknownEstimates} job${snap.forecast.unknownEstimates === 1 ? '' : 's'} without history, estimated from similar runs` : ''));
   }
-  return lines.join('\n');
+  return [...sick, ...lines].join('\n');
 }
 // Throughput report over finished job records: where lane time went, how long sessions waited,
 // and whether UI chunks that shared the host with a build failed more often than chunks that
@@ -871,7 +937,7 @@ async function cli(C, argv) {
       if (!['true', 'false'].includes(args.enabled)) throw new Error('--enabled must be true or false');
       testing.enabled = args.enabled === 'true';
     }
-    for (const [flag, key] of [['max-xcode', 'maxXcode'], ['max-simulators', 'maxSimulators'], ['jobs', 'jobs'], ['jobs-solo', 'jobsSolo']]) {
+    for (const [flag, key] of [['max-xcode', 'maxXcode'], ['max-simulators', 'maxSimulators'], ['jobs', 'jobs'], ['jobs-solo', 'jobsSolo'], ['boot-timeout-ms', 'bootTimeoutMs']]) {
       if (args[flag] !== undefined) { const n = Number(args[flag]); if (!Number.isInteger(n) || n < 1) throw new Error('invalid --' + flag); testing[key] = n; }
     }
     if (args.overlap !== undefined) {
@@ -918,7 +984,7 @@ async function cli(C, argv) {
   if (args.json) console.log(JSON.stringify(result));
   else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
 }
-module.exports = { capacityBlock, jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { bootDevice, work, execute, unhealthyDevices, markUnhealthy, clearUnhealthy, poolUnhealthy, waitReason, capacityBlock, jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);

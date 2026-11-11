@@ -179,8 +179,11 @@ function render(s) {
     return '<div class="card"><div class="row"><span class="pill ' + p.state + '">' + p.state + '</span><span class="grow title">' + esc(p.name) + '</span><span class="mute">' + esc(p.ownerName) + ' · ' + esc(p.worktree || '') + '</span></div>' +
       '<div class="chunks">' + members.map((j) => '<span class="pill ' + j.state + '" title="' + j.id + '">' + icon(j) + ' ' + esc(j.label) + (j.tests ? ' (' + j.tests + ')' : '') + '</span>').join('') + '</div></div>';
   }), 'No verify runs in the last 30 minutes.');
-  fill('devices', s.devices.map((d) => '<div class="card" style="cursor:default"><div class="row"><span class="grow title">' + esc(d.name) + '</span><span class="pill ' + (d.state === 'booted' ? 'running' : '') + '">' + esc(d.state) + '</span></div>' +
-    '<div class="mute" style="font-size:12px;margin-top:4px">' + esc(d.runtime) + '<br>' + (d.holder ? 'leased by ' + esc(d.holder) + (d.jobId ? ' · ' + d.jobId.slice(0, 13) + '…' : '') : 'free') + '</div></div>'), 'No agent simulators.');
+  fill('devices', s.devices.map((d) => '<div class="card" style="cursor:default"><div class="row"><span class="grow title">' + esc(d.name) + '</span>' +
+    (d.unhealthy ? '<span class="pill failed" title="' + esc(d.unhealthy.reason || '') + '">unhealthy</span>' : '') +
+    '<span class="pill ' + (d.state === 'booted' ? 'running' : '') + '">' + esc(d.state) + '</span></div>' +
+    '<div class="mute" style="font-size:12px;margin-top:4px">' + esc(d.runtime) + '<br>' + (d.holder ? 'leased by ' + esc(d.holder) + (d.jobId ? ' · ' + d.jobId.slice(0, 13) + '…' : '') : 'free') +
+    (d.unhealthy ? '<br>skipped by the queue · coord.js sim reset ' + esc(d.name) : '') + '</div></div>'), 'No agent simulators.');
   fill('recent', done.map((j) => job(j, now, false)), 'Nothing finished recently.');
 }
 async function poll() {

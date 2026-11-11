@@ -429,7 +429,7 @@ test('snapshot lists active, queued and recent jobs, groups verify runs and join
   assert.equal(snap.jobs[1].queuePosition, 1);
   assert.equal(snap.jobs[0].worktree, 'app-feature');
   assert.deepEqual(snap.pipelines.map((p) => [p.name, p.state, p.jobs.length]), [['verify_abc', 'running', 3]]);
-  assert.deepEqual(snap.devices, [{ name: 'Aircontrol-Agent', key: device.key, runtime: 'iOS 26.5', state: 'shutdown', holder: 'owner-name', jobId: 'test_00000000000000a2', purpose: null }]);
+  assert.deepEqual(snap.devices, [{ name: 'Aircontrol-Agent', key: device.key, runtime: 'iOS 26.5', state: 'shutdown', holder: 'owner-name', jobId: 'test_00000000000000a2', purpose: null, unhealthy: null }]);
   assert.match(Q.renderList(snap), /test_00000000000000a3 queued +#1 .*ScanUITests.*starts ~/);
   assert.match(Q.renderList(snap), /queue drains in ~\d+m/);
   assert.ok(snap.forecast.drainMs > 0 && snap.jobs[1].startsInMs >= 0 && snap.jobs[1].etaMs > snap.jobs[1].startsInMs);
@@ -496,4 +496,91 @@ test('build jobs reject physical-device destinations but allow generic and simul
     Q.validateCommand(['xcodebuild', '-destination', dest, 'build'], 'build', __dirname, cfg);
   }
   assert.ok(session);
+});
+function fakeXcrun(hangs) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-xcrun-'));
+  const calls = path.join(dir, 'calls');
+  const script = path.join(dir, 'xcrun.sh');
+  fs.writeFileSync(script, `echo "$2" >> ${JSON.stringify(calls)}\nif [ "$2" = bootstatus ] && [ "$(grep -c '^bootstatus$' ${JSON.stringify(calls)})" -le ${hangs} ]; then exec sleep 30; fi\nexit 0\n`);
+  return { xcrun: ['/bin/sh', script], calls: () => fs.readFileSync(calls, 'utf8').trim().split('\n') };
+}
+async function startedSimJob(session, dev = device) {
+  const job = await Q.submit(C, options('ios-test'), session, noRunner);
+  Object.assign(job, { state: 'starting', timings: {}, device: dev, workerPid: process.pid });
+  Q.atomic(Q.file(C, job.id), job);
+  C.tryLease({ ...dev, sessionId: session.sessionId, jobId: job.id, acquiredAt: new Date().toISOString() });
+  return job;
+}
+test('a hung boot is killed, the device shut down and booted again, and the job proceeds', { timeout: 20000 }, async () => {
+  const session = setup();
+  const fake = fakeXcrun(1);
+  const job = await startedSimJob(session);
+  await Q.work(C, job.id, { xcrun: fake.xcrun, bootTimeoutMs: 400 });
+  const done = Q.status(C, job.id);
+  assert.equal(done.result, 'succeeded', done.error);
+  assert.equal(done.bootRetries, 1);
+  assert.deepEqual(fake.calls(), ['boot', 'bootstatus', 'shutdown', 'boot', 'bootstatus']);
+  assert.deepEqual(Q.unhealthyDevices(C), {});
+  assert.match(fs.readFileSync(done.log, 'utf8'), /boot attempt 1 on Aircontrol-Agent .* did not finish/);
+});
+test('a boot that hangs twice fails the job, benches the device and releases the lane', { timeout: 20000 }, async () => {
+  const session = setup();
+  const fake = fakeXcrun(2);
+  const job = await startedSimJob(session, { ...device, state: 'booted' });
+  await Q.work(C, job.id, { xcrun: fake.xcrun, bootTimeoutMs: 300 });
+  assert.deepEqual(fake.calls(), ['bootstatus', 'shutdown', 'boot', 'bootstatus', 'shutdown']);
+  const failed = Q.status(C, job.id);
+  assert.equal(failed.result, 'failed');
+  assert.match(failed.error, /simulator Aircontrol-Agent did not finish booting/);
+  assert.match(failed.error, /coord\.js sim reset Aircontrol-Agent/);
+  assert.equal(Q.unhealthyDevices(C)[device.key].jobId, job.id);
+  // A wedged device may refuse to shut down; that must not keep the lane.
+  assert.equal(Q.cleanup(C, failed, { ...deps, shutdownDevice: () => false, listIos: () => [{ ...device, state: 'booted' }] }), true);
+  assert.equal(Q.status(C, job.id).state, 'failed');
+  assert.equal(C.readLease('ios', device.key), null);
+  const next = await Q.submit(C, options('ios-test'), session, noRunner);
+  await Q.tick(C, deps);
+  assert.equal(Q.status(C, next.id).state, 'queued');
+  assert.match(Q.status(C, next.id).waitReason, /simulator Aircontrol-Agent unhealthy; run coord\.js sim reset Aircontrol-Agent/);
+  const snap = Q.snapshot(C, { ...deps, devices: [device], readLeases: () => [] });
+  assert.equal(snap.devices[0].unhealthy.jobId, job.id);
+  assert.equal(snap.unhealthy.length, 1);
+  assert.match(Q.renderList(snap), /^unhealthy: Aircontrol-Agent .*sim reset Aircontrol-Agent/);
+  assert.match(Q.renderTestsLine(Q.status(C), 'queue-owner', Date.now(), Q.unhealthyDevices(C)), /unhealthy sim Aircontrol-Agent/);
+  assert.match(Q.renderTestsLine([], 'queue-owner', Date.now(), Q.unhealthyDevices(C)), /^\[aircontrol\] tests: ⚠️ unhealthy sim/);
+});
+test('the dispatcher skips a benched device and runs the next job on another pool device', async () => {
+  const session = setup({ allowedNames: ['Aircontrol-Agent', 'Aircontrol-Agent-2'] });
+  const spare = { ...device, name: 'Aircontrol-Agent-2', key: 'FFFFFFFF-BBBB-CCCC-DDDD-EEEEEEEEEEEE' };
+  await Q.markUnhealthy(C, device, { reason: 'test' });
+  const pool = { ...deps, listIos: () => [device, spare] };
+  const job = await Q.submit(C, options('ios-test'), session, { ...noRunner, listDevices: () => [device, spare] });
+  assert.equal(Q.status(C, job.id, deps).waitReason, 'scheduler turn');
+  await Q.tick(C, { ...pool, spawn: () => ({ pid: 999999, on() {}, unref() {} }) });
+  assert.equal(Q.status(C, job.id).device.key, spare.key);
+  assert.equal(C.readLease('ios', device.key), null);
+  const blocked = C.acquireDevice({ sessionId: 'x', platform: 'ios', nowMs: Date.now(), queuedJob: 'test_00000000000000cc' }, { ...deps, listIos: () => [device] });
+  assert.equal(blocked.reason, 'unhealthy');
+});
+test('sim reset shuts down and erases a benched pool device, clears the mark, and refuses others', async () => {
+  setup({ protectedDevices: ['Personal'] });
+  await Q.markUnhealthy(C, device, { reason: 'test' });
+  const ran = [];
+  const simDeps = { ...deps, listIos: () => [device, { ...device, name: 'Personal', key: 'P' }, { ...device, name: 'Other', key: 'O' }], simctl: (argv) => ran.push(argv.join(' ')) };
+  const result = C.resetSimulator('Aircontrol-Agent', {}, simDeps);
+  assert.equal(result.wasUnhealthy, true);
+  assert.deepEqual(ran, ['shutdown ' + device.key, 'erase ' + device.key]);
+  assert.deepEqual(Q.unhealthyDevices(C), {});
+  assert.throws(() => C.resetSimulator('Personal', {}, simDeps), /protected/);
+  assert.throws(() => C.resetSimulator('Other', {}, simDeps), /not a test-queue pool device/);
+  C.tryLease({ ...device, sessionId: 'someone', acquiredAt: new Date().toISOString() });
+  assert.throws(() => C.resetSimulator(device.key, {}, simDeps), /leased/);
+  assert.equal(C.releaseLease('ios', device.key), true);
+  await Q.markUnhealthy(C, device, { reason: 'test' });
+  assert.throws(() => C.resetSimulator(device.key, {}, { ...simDeps, simctl: (argv) => { if (argv[0] === 'erase') throw new Error('boom'); } }), /stays benched/);
+  assert.match(Q.unhealthyDevices(C)[device.key].reason, /reset failed: boom/);
+  ran.length = 0;
+  assert.equal(C.resetSimulator(device.key, { erase: false }, simDeps).erased, false);
+  assert.deepEqual(ran, ['shutdown ' + device.key]);
+  assert.deepEqual(Q.unhealthyDevices(C), {});
 });

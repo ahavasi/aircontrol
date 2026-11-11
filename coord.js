@@ -40,7 +40,7 @@ const SCAN_PRUNE_DIRS = new Set([
   'node_modules', 'DerivedData', 'Pods', '.build', 'build', 'dist',
   '.next', '.cache', 'vendor',
 ]);
-const BOOLEAN_ARGS = new Set(['repair', 'extra', 'mine', 'json', 'idle', 'assignable', 'others', 'global', 'dry-run', 'no-mirror-global', 'shutdown', 'keep-booted', 'notes', 'prune', 'codex', 'claude']);
+const BOOLEAN_ARGS = new Set(['repair', 'extra', 'mine', 'json', 'idle', 'assignable', 'others', 'global', 'dry-run', 'no-mirror-global', 'shutdown', 'keep-booted', 'no-erase', 'notes', 'prune', 'codex', 'claude']);
 // Resources compared only within one repo; everything else (sim:*, deploy:*, …)
 // is machine-global contention.
 const REPO_SCOPED_RESOURCES = new Set(['stash']);
@@ -1631,7 +1631,7 @@ function cmdInject(input, nowMs, harness) {
   let testsLine = '';
   try {
     const Q = require('./test-queue.js');
-    if (Q.config(module.exports).enabled) testsLine = Q.renderTestsLine(Q.status(module.exports), id, nowMs);
+    if (Q.config(module.exports).enabled) testsLine = Q.renderTestsLine(Q.status(module.exports), id, nowMs, Q.unhealthyDevices(module.exports));
   } catch { testsLine = ''; }
   const context = [renderInjection(s, others, inbox, nowMs, cliPath, ledgerLine, budgetLine, diskLine, testsLine), cloudLine].filter(Boolean).join('\n');
   if (resolvedHarness === 'grok') {
@@ -2224,10 +2224,13 @@ function acquireDevice(opts, deps = {}) {
   pruneLeases(nowMs, deps, { shutdown: true });
   const Q = require('./test-queue.js');
   const cfg = Q.config(module.exports);
-  const devices = listDevices(platform, deps).filter((d) =>
+  const compatible = listDevices(platform, deps).filter((d) =>
     (!opts.runtime || d.runtime === opts.runtime) && (!prefer || d.name.toLowerCase() === String(prefer).toLowerCase()) &&
     (!cfg.enabled || d.platform !== 'ios' || Q.deviceAllowed(d, cfg, { runtime: opts.runtime, name: prefer })));
-  if (!devices.length) return { ok: false, reason: 'no-devices', free: [], held: [] };
+  if (!compatible.length) return { ok: false, reason: 'no-devices', free: [], held: [] };
+  const benched = opts.queuedJob ? Q.unhealthyDevices(module.exports) : {};
+  const devices = compatible.filter((d) => d.platform !== 'ios' || !benched[d.key]);
+  if (!devices.length) return { ok: false, reason: 'unhealthy', free: [], held: [] };
 
   const heldKeys = new Map(readLeases().map((l) => [`${l.platform}-${l.key}`, l]));
 
@@ -2421,6 +2424,36 @@ async function cmdDevice(args, deps = {}) {
   }, deps);
 }
 
+// Recovery for a pool simulator the test queue benched after its boot hung twice. The device
+// stays benched while it is being reset so the dispatcher cannot hand it out mid-erase.
+function resetSimulator(target, opts = {}, deps = {}) {
+  if (!target) throw new Error('usage: coord.js sim reset <name|udid> [--no-erase]');
+  const Q = require('./test-queue.js');
+  const C = module.exports;
+  const cfg = Q.config(C);
+  const benched = Q.unhealthyDevices(C);
+  const matches = listDevices('ios', deps).filter((d) => d.key === target || d.name === target);
+  const device = matches.find((d) => benched[d.key]) || matches.find((d) => d.runtime === cfg.runtime) || matches[0];
+  if (!device) throw new Error(`no iOS simulator named or keyed "${target}"`);
+  if (cfg.protectedDevices.some((s) => s === device.key || s === device.name)) throw new Error(`${device.name} is a protected device; reset it by hand`);
+  if (!benched[device.key] && !cfg.allowedNames.includes(device.name)) throw new Error(`${device.name} is not a test-queue pool device (testing.allowedNames); refusing to erase it`);
+  const lease = readLease('ios', device.key);
+  if (lease && (!lease.jobId || Q.activeLease(C, lease))) throw new Error(`${device.name} is leased to ${describeLease(lease, Date.now())}; reset it once that lease ends`);
+  if (lease) releaseLease('ios', device.key);
+  const wasUnhealthy = !!benched[device.key];
+  Q.atomic(path.join(Q.root(C), 'unhealthy.json'), { ...benched, [device.key]: { ...(benched[device.key] || { key: device.key, name: device.name, runtime: device.runtime, at: Date.now() }), resetting: true } });
+  const simctl = deps.simctl || ((argv, timeout) => execFileSync('xcrun', ['simctl', ...argv], { stdio: 'ignore', timeout }));
+  try {
+    try { simctl(['shutdown', device.key], 60000); } catch {}
+    if (opts.erase !== false) simctl(['erase', device.key], 180000);
+  } catch (error) {
+    Q.atomic(path.join(Q.root(C), 'unhealthy.json'), { ...Q.unhealthyDevices(C), [device.key]: { ...(benched[device.key] || { key: device.key, name: device.name, runtime: device.runtime, at: Date.now() }), reason: 'reset failed: ' + (error.message || error) } });
+    throw new Error(`reset of ${device.name} failed: ${error.message || error}; it stays benched`);
+  }
+  Q.clearUnhealthy(C, device.key);
+  return { device, erased: opts.erase !== false, wasUnhealthy };
+}
+
 function cmdSim(args, nowMs, deps = {}) {
   const sub = args._[1];
   if (args.session) {
@@ -2539,7 +2572,13 @@ function cmdSim(args, nowMs, deps = {}) {
     return;
   }
 
-  throw new Error('usage: coord.js sim <list|acquire|release> [--session id] [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
+  if (sub === 'reset') {
+    const result = resetSimulator(args._[2] || args.key || args.name, { erase: !(args['no-erase'] === true || args.erase === 'false') }, deps);
+    console.log(`${result.erased ? 'erased' : 'shut down'} ${result.device.name} (${result.device.key})${result.wasUnhealthy ? '; unhealthy mark cleared, the test queue will use it again' : ''}`);
+    return;
+  }
+
+  throw new Error('usage: coord.js sim <list|acquire|release|reset> [--session id] [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
 }
 
 // ---------- cross-repo work ledger ----------
@@ -5363,7 +5402,7 @@ module.exports = {
   readLeases, readLease, tryLease, releaseLease, releaseSessionLeases, shutdownLeaseDevice, shutdownAndReleaseLeases, quitSimulatorIfIdle, pruneLeases, touchLeases,
   readAffinity, writeAffinity, affinityFor, recordAffinity, clearAffinity, appInstalled,
   simDeviceRoot, installedBundleIds,
-  acquireDevice, renderSimList, describeLease, cmdSim, cmdDevice, installOnDevice, pairedIphones, SEED_PROBE_LIMIT,
+  acquireDevice, resetSimulator, renderSimList, describeLease, cmdSim, cmdDevice, installOnDevice, pairedIphones, SEED_PROBE_LIMIT,
   cmdWorktrees, selectBrowserProcs, classifyBrowserProcs, readAllProcs, liveClaudePids, browserContext, cmdBrowsers, reapOwnBrowsers, reapOrphanBrowsers,
   parseProcTable, claudeAncestor, classifyTaskProcs, descendantsOf, readTaskProcs, reapOwnTasks, cmdTasks,
   ownTasksRunning,
