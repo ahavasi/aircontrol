@@ -101,6 +101,14 @@ function lastOutputAt(C, job) {
   return at || null;
 }
 const NEVER_STARTED_MS = 60 * 1000;
+// Between the end of its build and the first line from its test runner, a simulator test prints
+// nothing: on a busy host healthy runs have waited 38 minutes there and then passed. Silence
+// cannot tell that wait from a hang, so past the build only a dead runner or the wall-clock cap
+// ends the job. A raw `xcodebuild test` names no phase, so its whole command counts as testing.
+function inTestPhase(C, job) {
+  if (!simulatorJob(job.kind) || job.phase !== 'command') return false;
+  return readJson(path.join(root(C), job.id + '.phase.json'))?.phase !== 'build';
+}
 // Why a started job can no longer be trusted to finish by itself, or null while it can.
 function liveness(C, cfg, job, now = Date.now(), deps = {}) {
   if (job.state !== 'starting' && job.state !== 'running') return null;
@@ -108,7 +116,7 @@ function liveness(C, cfg, job, now = Date.now(), deps = {}) {
   if (!runnerAlive(job, deps)) return { state: 'failed', reason: 'runner died' };
   const last = lastOutputAt(C, job);
   const silentMs = last ? now - last : 0;
-  if (silentMs > cfg.stallTimeoutMs) return { state: 'timed_out', reason: `no log output for ${formatDuration(silentMs)} (limit ${formatDuration(cfg.stallTimeoutMs)})` };
+  if (silentMs > cfg.stallTimeoutMs && !inTestPhase(C, job)) return { state: 'timed_out', reason: `no log output for ${formatDuration(silentMs)} (limit ${formatDuration(cfg.stallTimeoutMs)})` };
   const cap = cfg.maxRunMs[job.kind];
   if (cap && job.startedAt && now - job.startedAt > cap) return { state: 'timed_out', reason: `${job.kind} ran past its ${formatDuration(cap)} limit` };
   return null;

@@ -414,10 +414,12 @@ Submission returns immediately; eligible jobs acquire their device when admitted
 A started job cannot hold the queue once it stops being able to finish. The dispatcher, and every `test list`, `test status` and `test submit`, checks each one:
 
 - its runner process is gone: the job ends `failed` with `runner died`;
-- nothing was written to its log (or the log its phase file names) for `stallTimeoutMs`, 10 minutes by default: `timed_out`;
+- nothing was written to its log (or the log its phase file names) for `stallTimeoutMs`, 10 minutes by default, while it boots or builds: `timed_out`;
 - it ran past the cap for its kind, `maxRunMs`, by default 20 minutes for `build` and 45 for `ios-test` and `ios-test-only`: `timed_out`.
 
 In each case the job's process group is killed, its simulator lease is released by the ordinary cleanup, and the next job starts. Change the limits with `test configure --stall-timeout-ms 600000 --max-run-ms build=1200000,ios-test=2700000`. A build that runs `xcodebuild -quiet` prints nothing while it compiles, so give it a longer stall limit or drop the flag.
+
+Silence does not count once a simulator job (`ios-test`, `ios-test-only`) is past its build. Between the end of the build and the first line from the test runner `xcodebuild` prints nothing, and on a busy host that wait has run past half an hour for runs that then passed, so there the job ends only when its runner dies or it reaches `maxRunMs`. A runner script that writes `{ "phase": "build" }` to `AIRCONTROL_TEST_PHASE_PATH` keeps the stall limit for its build; a raw `xcodebuild test` names no phase, so its whole command is treated as testing. `test list` still shows `no output for Xm`.
 
 `test cancel` is for the submitting session while the job is healthy. Any session may cancel a job that fails the checks above, and `test cancel <job-id> --force` cancels any job or pipeline and records the session that forced it (`forcedBy`).
 
