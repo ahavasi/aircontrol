@@ -411,6 +411,18 @@ node ~/.codex/hooks/coord.js test cancel <job-id> --session <name>
 
 Submission returns immediately; eligible jobs acquire their device when admitted. Raw Xcode commands receive the assigned UDID and bounded build operations, with parallel test runners disabled. Use `--kind build` for generic-destination compilation without a simulator, `--kind ios-test-only` for `test-without-building`, or legacy `ios-test` for combined build/test work. Manual iOS leases consume simulator capacity, and unmanaged Xcode processes must drain before queued work starts. Protected device names/UDIDs and allowed names/runtimes remain enforced.
 
+A started job cannot hold the queue once it stops being able to finish. The dispatcher, and every `test list`, `test status` and `test submit`, checks each one:
+
+- its runner process is gone: the job ends `failed` with `runner died`;
+- nothing was written to its log (or the log its phase file names) for `stallTimeoutMs`, 10 minutes by default: `timed_out`;
+- it ran past the cap for its kind, `maxRunMs`, by default 20 minutes for `build` and 45 for `ios-test` and `ios-test-only`: `timed_out`.
+
+In each case the job's process group is killed, its simulator lease is released by the ordinary cleanup, and the next job starts. Change the limits with `test configure --stall-timeout-ms 600000 --max-run-ms build=1200000,ios-test=2700000`. A build that runs `xcodebuild -quiet` prints nothing while it compiles, so give it a longer stall limit or drop the flag.
+
+`test cancel` is for the submitting session while the job is healthy. Any session may cancel a job that fails the checks above, and `test cancel <job-id> --force` cancels any job or pipeline and records the session that forced it (`forcedBy`).
+
+When the head of the queue cannot start, `test list` and `test status` give the reason in place of a start time: `blocked by <job-id> (stalled 4m)` for a job that went quiet, or `blocked by external build pid <pid> (<cwd>)` for an `xcodebuild` the queue did not start, such as one run by a git hook.
+
 Optional submission flags: `--depends-on test_id,test_id`, `--priority interactive|batch`, and `--resource /absolute/workspace` (defaults to cwd). Dependency failure or cancellation blocks descendants. Eligible interactive work runs first, with the oldest eligible batch job admitted after three interactive dispatches. Active work is never preempted. Status includes dependency, workspace, and host-capacity wait reasons.
 
 For a build followed by test chunks, use `test pipeline --session NAME --file plan.json`. The JSON contains `cwd`, `resource`, and `jobs`; each job has `kind`, `command` (an argv array), optional `priority`, `runtime`, `bundleId`, and `dependsOn` (indexes of earlier jobs). Submission is atomic and returns a pipeline ID plus job IDs. A pipeline reserves its workspace from its first admission until all jobs terminate, including gaps between chunks. Jobs sharing that resource cannot overlap. Project runners aggregate chunk results and reject stale source/products; dependencies must not form cycles. Use `test status <pipeline-id> --json` for only that pipeline’s jobs, or `test cancel <pipeline-id> --session NAME` to cancel every remaining job atomically. Cancellation remains restricted to the submitting session.

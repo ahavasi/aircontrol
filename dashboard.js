@@ -101,7 +101,7 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute
 .title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pill{font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid var(--line);white-space:nowrap}
 .pill.running,.pill.starting,.pill.cleaning{color:var(--accent);border-color:var(--accent)}.pill.succeeded{color:var(--ok);border-color:var(--ok)}
-.pill.failed,.pill.blocked,.pill.cancelled{color:var(--bad);border-color:var(--bad)}.pill.queued{color:var(--mute)}
+.pill.failed,.pill.blocked,.pill.cancelled,.pill.timed_out{color:var(--bad);border-color:var(--bad)}.pill.queued{color:var(--mute)}
 .bar{height:6px;background:var(--track);border-radius:99px;overflow:hidden;margin-top:8px}.bar>i{display:block;height:100%;background:var(--accent);transform-origin:left;transition:transform .8s}
 .bar.over>i{background:var(--warn)}
 .steps{display:flex;gap:4px;margin-top:8px}.steps span{flex:1;font-size:11px;text-align:center;padding:2px 0;border-radius:6px;background:var(--track);color:var(--mute)}
@@ -157,7 +157,7 @@ function render(s) {
   const now = Date.now();
   const active = s.jobs.filter((j) => ['starting','running','cleaning'].includes(j.state));
   const queued = s.jobs.filter((j) => j.state === 'queued');
-  const done = s.jobs.filter((j) => ['succeeded','failed','cancelled','blocked'].includes(j.state));
+  const done = s.jobs.filter((j) => ['succeeded','failed','cancelled','blocked','timed_out'].includes(j.state));
   const stat = (label, value, sub, cls) => '<div class="stat' + (cls ? ' ' + cls : '') + '"><small>' + label + '</small><b>' + value + '</b>' + (sub ? '<span class="sub">' + sub + '</span>' : '') + '</div>';
   const at = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const pending = active.length + queued.length;
@@ -175,7 +175,7 @@ function render(s) {
   fill('queued', queued.map((j) => job(j, now, false)), 'Queue empty.');
   fill('pipelines', s.pipelines.map((p) => {
     const members = p.jobs.map((id) => s.jobs.find((j) => j.id === id)).filter(Boolean);
-    const icon = (j) => j.state === 'succeeded' ? '✓' : ['failed','blocked','cancelled'].includes(j.state) ? '✗' : j.state === 'queued' ? '·' : '▶';
+    const icon = (j) => j.state === 'succeeded' ? '✓' : ['failed','blocked','cancelled','timed_out'].includes(j.state) ? '✗' : j.state === 'queued' ? '·' : '▶';
     return '<div class="card"><div class="row"><span class="pill ' + p.state + '">' + p.state + '</span><span class="grow title">' + esc(p.name) + '</span><span class="mute">' + esc(p.ownerName) + ' · ' + esc(p.worktree || '') + '</span></div>' +
       '<div class="chunks">' + members.map((j) => '<span class="pill ' + j.state + '" title="' + j.id + '">' + icon(j) + ' ' + esc(j.label) + (j.tests ? ' (' + j.tests + ')' : '') + '</span>').join('') + '</div></div>';
   }), 'No verify runs in the last 30 minutes.');
