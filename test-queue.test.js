@@ -686,6 +686,53 @@ test('output in the log a runner names in its phase file counts against the stal
     assert.equal(Q.liveness(C, Q.config(C), run.job).state, 'timed_out');
   } finally { run.stop(); }
 });
+test('a simulator job that is alive but silent in its test phase outlives the stall limit', async () => {
+  const session = setup();
+  const run = await runningJob(session, { device, startedAt: minutesAgo(40), commandStartedAt: minutesAgo(39) }, 'ios-test');
+  const phase = path.join(Q.root(C), run.job.id + '.phase.json');
+  try {
+    age(run.job.log, 38);
+    assert.equal(Q.liveness(C, Q.config(C), run.job), null, 'a raw xcodebuild test declares no phase');
+    Q.atomic(phase, { phase: 'test' });
+    age(phase, 38);
+    assert.equal(Q.liveness(C, Q.config(C), run.job), null);
+    await Q.tick(C, { ...deps, spawn: fakeSpawn(run.child.pid) });
+    assert.equal(Q.status(C, run.job.id, deps).state, 'running');
+    assert.ok(Q.status(C, run.job.id, deps).stalledMs >= 37 * 60000, 'the silence is still reported');
+    assert.equal(Q.liveness(C, Q.config(C), { ...run.job, kind: 'ios-test-only' }), null);
+  } finally { run.stop(); }
+});
+test('a silent test phase still ends when its runner dies or it passes the wall-clock cap', async () => {
+  const session = setup();
+  const run = await runningJob(session, { device, startedAt: minutesAgo(30), commandStartedAt: minutesAgo(29) }, 'ios-test');
+  try {
+    age(run.job.log, 25);
+    const cfg = Q.config(C);
+    assert.equal(Q.liveness(C, cfg, run.job), null);
+    assert.equal(Q.liveness(C, cfg, { ...run.job, startedAt: minutesAgo(46) }).reason, 'ios-test ran past its 45m limit');
+    run.child.kill('SIGKILL');
+    await run.exited;
+    assert.deepEqual(Q.liveness(C, cfg, run.job), { state: 'failed', reason: 'runner died' });
+    await Q.reap(C, deps);
+    assert.deepEqual([Q.status(C, run.job.id, deps).state, Q.status(C, run.job.id, deps).error], ['failed', 'runner died']);
+  } finally { run.stop(); }
+});
+test('silence while a simulator job boots or builds still counts as a stall', async () => {
+  const session = setup();
+  const run = await runningJob(session, { device, startedAt: minutesAgo(15), commandStartedAt: minutesAgo(14) }, 'ios-test');
+  const phase = path.join(Q.root(C), run.job.id + '.phase.json');
+  try {
+    const cfg = Q.config(C);
+    age(run.job.log, 11);
+    assert.equal(Q.liveness(C, cfg, { ...run.job, phase: 'boot', commandStartedAt: undefined }).state, 'timed_out');
+    Q.atomic(phase, { phase: 'build' });
+    age(phase, 9);
+    assert.equal(Q.liveness(C, cfg, run.job), null, 'inside the limit');
+    age(phase, 11);
+    assert.match(Q.liveness(C, cfg, run.job).reason, /^no log output for 11m \(limit 10m\)$/);
+    assert.equal(Q.liveness(C, cfg, { ...run.job, kind: 'build', device: undefined }).state, 'timed_out');
+  } finally { run.stop(); }
+});
 test('per-kind wall-clock caps default to 20 and 45 minutes and are configurable', async () => {
   const session = setup();
   const alive = { runnerAlive: () => true };
