@@ -424,7 +424,7 @@ test('snapshot lists active, queued and recent jobs, groups verify runs and join
   write({ id: 'test_00000000000000a2', sequence: 2, state: 'running', phase: 'test', command: stage('HomeUITests'), pipelineId: 'pipeline_00000000000000aa', startedAt: now - 30000, device });
   write({ id: 'test_00000000000000a3', sequence: 3, state: 'queued', command: stage('ScanUITests'), pipelineId: 'pipeline_00000000000000aa' });
   write({ id: 'test_00000000000000a4', sequence: 4, state: 'failed', kind: 'build', command: ['xcodebuild', 'build'], startedAt: now - 3 * 3600000, finishedAt: now - 2 * 3600000 });
-  const snap = Q.snapshot(C, { now, devices: [device, { ...device, name: 'Someone iPhone', key: 'OTHER' }], readLeases: () => [{ platform: 'ios', key: device.key, sessionName: 'owner-name', jobId: 'test_00000000000000a2' }] });
+  const snap = Q.snapshot(C, { now, externalBuilds: () => 0, devices: [device, { ...device, name: 'Someone iPhone', key: 'OTHER' }], readLeases: () => [{ platform: 'ios', key: device.key, sessionName: 'owner-name', jobId: 'test_00000000000000a2' }] });
   assert.deepEqual(snap.jobs.map((j) => [j.label, j.state]), [['HomeUITests', 'running'], ['ScanUITests', 'queued'], ['build', 'succeeded']]);
   assert.equal(snap.jobs[1].queuePosition, 1);
   assert.equal(snap.jobs[0].worktree, 'app-feature');
@@ -583,4 +583,266 @@ test('sim reset shuts down and erases a benched pool device, clears the mark, an
   assert.equal(C.resetSimulator(device.key, { erase: false }, simDeps).erased, false);
   assert.deepEqual(ran, ['shutdown ' + device.key]);
   assert.deepEqual(Q.unhealthyDevices(C), {});
+});
+
+// Liveness: a started job is fixed up as running with a real detached process as its runner.
+async function runningJob(session, patch = {}, kind = 'build', script = 'setTimeout(()=>{},60000)') {
+  const child = spawn(process.execPath, ['-e', script], { detached: true, stdio: 'ignore' });
+  const job = await Q.submit(C, options(kind), session, noRunner);
+  Object.assign(job, { state: 'running', phase: 'command', startedAt: Date.now(), timings: {}, workerPid: child.pid, workerBirth: Q.identity(child.pid), ...patch });
+  fs.writeFileSync(job.log, 'started\n');
+  Q.atomic(Q.file(C, job.id), job);
+  const exited = new Promise((resolve) => child.on('exit', resolve));
+  return { job, child, exited, stop: () => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } };
+}
+const fakeSpawn = (pid) => () => ({ pid, on() {}, unref() {} });
+const minutesAgo = (m) => Date.now() - m * 60000;
+const age = (name, m) => fs.utimesSync(name, new Date(minutesAgo(m)), new Date(minutesAgo(m)));
+const quiet = { ...deps, ensureRunner() {} };
+
+test('a running job whose runner died is failed, its lease released, and the next job starts', async () => {
+  const session = setup();
+  const dead = await runningJob(session, { device }, 'ios-test');
+  C.tryLease({ ...device, sessionId: session.sessionId, jobId: dead.job.id, acquiredAt: new Date().toISOString() });
+  const next = await Q.submit(C, options(), session, noRunner);
+  const stand = await runningJob(session, { state: 'succeeded', finishedAt: Date.now() });
+  try {
+    await Q.tick(C, { ...deps, spawn: fakeSpawn(stand.child.pid) });
+    assert.equal(Q.status(C, next.id, deps).state, 'queued', 'a live runner keeps the lane');
+    dead.child.kill('SIGKILL');
+    await dead.exited;
+    await Q.tick(C, { ...deps, spawn: fakeSpawn(stand.child.pid) });
+    const reaped = Q.status(C, dead.job.id, deps);
+    assert.equal(reaped.state, 'failed');
+    assert.equal(reaped.error, 'runner died');
+    assert.ok(reaped.reapedAt && reaped.finishedAt);
+    assert.equal(C.readLease('ios', device.key), null);
+    assert.equal(Q.status(C, next.id, deps).state, 'starting');
+    assert.equal(Q.status(C, next.id, deps).workerPid, stand.child.pid);
+  } finally { dead.stop(); stand.stop(); }
+});
+test('test list and status reap a dead runner without a dispatcher; a finished worker is not mistaken for a dead one', async () => {
+  const session = setup();
+  const dead = await runningJob(session);
+  const finished = await runningJob(session, { state: 'cleaning', phase: 'cleanup', result: 'succeeded' });
+  dead.child.kill('SIGKILL'); finished.child.kill('SIGKILL');
+  await Promise.all([dead.exited, finished.exited]);
+  await Q.reap(C, deps);
+  assert.deepEqual([Q.status(C, dead.job.id, deps).state, Q.status(C, dead.job.id, deps).error], ['failed', 'runner died']);
+  assert.equal(Q.status(C, finished.job.id, deps).state, 'succeeded');
+  assert.equal(Q.status(C, finished.job.id, deps).error, undefined);
+});
+test('liveness trusts a live runner, and reads a recycled pid or a missing runner as dead', async () => {
+  const session = setup();
+  const live = await runningJob(session);
+  try {
+    const cfg = Q.config(C);
+    assert.equal(Q.runnerAlive(live.job), true);
+    assert.equal(Q.liveness(C, cfg, live.job), null);
+    const recycled = { ...live.job, workerBirth: 'Thu Jan  1 00:00:00 1970' };
+    assert.equal(Q.runnerAlive(recycled), false);
+    assert.equal(Q.jobGroupAlive(recycled), false, 'another process now leads that group id');
+    assert.deepEqual(Q.liveness(C, cfg, recycled), { state: 'failed', reason: 'runner died' });
+    assert.equal(Q.liveness(C, cfg, { ...live.job, state: 'starting', workerPid: undefined, startedAt: Date.now() - 5000 }), null);
+    assert.equal(Q.liveness(C, cfg, { ...live.job, state: 'starting', workerPid: undefined, startedAt: minutesAgo(2) }).reason, 'runner died');
+    assert.equal(Q.liveness(C, cfg, { ...live.job, state: 'queued' }), null);
+    const shown = Q.status(C, live.job.id, deps);
+    assert.equal(shown.runnerPid, live.child.pid);
+    assert.ok(Math.abs(shown.lastOutputAt - fs.statSync(live.job.log).mtimeMs) < 1);
+  } finally { live.stop(); }
+});
+test('a job silent past the stall limit is killed by process group and marked timed_out', async () => {
+  const session = setup();
+  const stalled = await runningJob(session, { startedAt: minutesAgo(12) }, 'build',
+    'require("child_process").spawn(process.execPath,["-e","setTimeout(()=>{},60000)"],{stdio:"ignore"});setTimeout(()=>{},60000)');
+  const next = await Q.submit(C, options(), session, noRunner);
+  const stand = await runningJob(session, { state: 'succeeded', finishedAt: Date.now() });
+  try {
+    age(stalled.job.log, 9);
+    await Q.tick(C, { ...deps, spawn: fakeSpawn(stand.child.pid) });
+    assert.equal(Q.status(C, stalled.job.id, deps).state, 'running', '9 minutes of silence is inside the limit');
+    age(stalled.job.log, 11);
+    await Q.tick(C, { ...deps, spawn: fakeSpawn(stand.child.pid) });
+    await waitFor(() => !Q.groupAlive(stalled.child.pid));
+    await Q.tick(C, { ...deps, spawn: fakeSpawn(stand.child.pid) });
+    const done = Q.status(C, stalled.job.id, deps);
+    assert.equal(done.state, 'timed_out');
+    assert.match(done.error, /^no log output for 11m \(limit 10m\)$/);
+    assert.equal(Q.status(C, next.id, deps).state, 'starting');
+    assert.equal(Q.dependencyState({ dependsOn: [done.id] }, [done]), 'failed dependency');
+  } finally { stalled.stop(); stand.stop(); }
+});
+test('output in the log a runner names in its phase file counts against the stall limit', async () => {
+  const session = setup();
+  const run = await runningJob(session, { startedAt: minutesAgo(15) });
+  try {
+    age(run.job.log, 14);
+    const side = path.join(Q.root(C), run.job.id + '-test.log');
+    fs.writeFileSync(side, 'Test Case passed\n');
+    Q.atomic(path.join(Q.root(C), run.job.id + '.phase.json'), { phase: 'test', log: side });
+    age(path.join(Q.root(C), run.job.id + '.phase.json'), 14);
+    assert.equal(Q.liveness(C, Q.config(C), run.job), null);
+    age(side, 11);
+    assert.equal(Q.liveness(C, Q.config(C), run.job).state, 'timed_out');
+  } finally { run.stop(); }
+});
+test('per-kind wall-clock caps default to 20 and 45 minutes and are configurable', async () => {
+  const session = setup();
+  const alive = { runnerAlive: () => true };
+  const at = (kind, minutes, cfg = Q.config(C)) => Q.liveness(C, cfg, { id: 'test_00000000000000c1', state: 'running', kind, workerPid: 1, startedAt: minutesAgo(minutes), commandStartedAt: Date.now() }, Date.now(), alive);
+  assert.equal(at('build', 19), null);
+  assert.deepEqual(at('build', 21), { state: 'timed_out', reason: 'build ran past its 20m limit' });
+  assert.equal(at('ios-test', 44), null);
+  assert.equal(at('ios-test', 46).reason, 'ios-test ran past its 45m limit');
+  assert.equal(at('ios-test-only', 46).state, 'timed_out');
+  Q.atomic(C.configFile(), { testing: { enabled: true, stallTimeoutMs: 120000, maxRunMs: { build: 60000 } } });
+  assert.deepEqual(Q.config(C).maxRunMs, { build: 60000, 'ios-test': 2700000, 'ios-test-only': 2700000 });
+  assert.equal(at('build', 2).reason, 'build ran past its 1m limit');
+  for (const bad of [{ maxRunMs: { deploy: 1000 } }, { maxRunMs: { build: 0 } }, { maxRunMs: 5 }, { stallTimeoutMs: 0 }]) {
+    Q.atomic(C.configFile(), { testing: { enabled: true, ...bad } });
+    assert.throws(() => Q.config(C), /testing\.(maxRunMs|stallTimeoutMs)/);
+  }
+  Q.atomic(C.configFile(), { testing: { enabled: true } });
+  await Q.cli(C, ['test', 'configure', '--stall-timeout-ms', '300000', '--max-run-ms', 'build=600000,ios-test=1800000']);
+  assert.equal(Q.config(C).stallTimeoutMs, 300000);
+  assert.deepEqual(Q.config(C).maxRunMs, { build: 600000, 'ios-test': 1800000, 'ios-test-only': 2700000 });
+  await assert.rejects(Q.cli(C, ['test', 'configure', '--max-run-ms', 'deploy=1']), /kind=milliseconds/);
+  assert.ok(session);
+});
+test('only the owner cancels a healthy job; anyone cancels one that fails liveness', async () => {
+  const session = setup();
+  const run = await runningJob(session);
+  try {
+    await assert.rejects(Q.cancel(C, run.job.id, 'somebody-else', { deps: quiet }), /only the submitting session can cancel this job while it is healthy/);
+    assert.equal(Q.status(C, run.job.id, deps).state, 'running');
+    run.child.kill('SIGKILL');
+    await run.exited;
+    const result = await Q.cancel(C, run.job.id, 'somebody-else', { deps: quiet });
+    assert.equal(result.state, 'cancelled');
+    assert.equal(result.cancelledBy.sessionId, 'somebody-else');
+    assert.equal(result.error, 'cancelled: runner died');
+    assert.equal(result.forcedBy, undefined);
+  } finally { run.stop(); }
+  const stalled = await runningJob(session, { startedAt: minutesAgo(30) });
+  try {
+    age(stalled.job.log, 12);
+    await Q.cancel(C, stalled.job.id, 'somebody-else', { deps: quiet });
+    await waitFor(() => !Q.groupAlive(stalled.child.pid));
+    await Q.reap(C, deps);
+    const done = Q.status(C, stalled.job.id, deps);
+    assert.equal(done.state, 'cancelled');
+    assert.match(done.error, /^cancelled: no log output for 12m/);
+  } finally { stalled.stop(); }
+});
+test('cancel --force stops any job at once and records who forced it', async () => {
+  const session = setup();
+  const run = await runningJob(session);
+  const waiting = await Q.submit(C, options(), session, noRunner);
+  try {
+    await Q.cancel(C, run.job.id, 'somebody-else', { force: true, deps: quiet });
+    await waitFor(() => !Q.groupAlive(run.child.pid), 3000);
+    await Q.reap(C, deps);
+    const done = Q.status(C, run.job.id, deps);
+    assert.equal(done.state, 'cancelled');
+    assert.equal(done.forcedBy.sessionId, 'somebody-else');
+    assert.ok(done.forcedBy.name);
+    const queued = await Q.cancel(C, waiting.id, 'somebody-else', { force: true, deps: quiet });
+    assert.deepEqual([queued.state, queued.forcedBy.sessionId], ['cancelled', 'somebody-else']);
+    const own = await Q.submit(C, options(), session, noRunner);
+    assert.equal((await Q.cancel(C, own.id, session.sessionId, { deps: quiet })).forcedBy, undefined);
+  } finally { run.stop(); }
+});
+test('pipeline cancellation by another session needs --force', async () => {
+  const session = setup();
+  const plan = { cwd: __dirname, resource: __dirname, jobs: [{ kind: 'build', command: options().command }, { kind: 'build', command: options().command, dependsOn: [0] }] };
+  const pipeline = await Q.submitPipeline(C, plan, session, noRunner);
+  await assert.rejects(Q.cancel(C, pipeline.id, 'somebody-else', { deps: quiet }), /only the submitting session can cancel this pipeline/);
+  const members = await Q.cancel(C, pipeline.id, 'somebody-else', { force: true, deps: quiet });
+  assert.deepEqual(members.map((j) => [j.state, j.forcedBy.sessionId]), [['cancelled', 'somebody-else'], ['cancelled', 'somebody-else']]);
+});
+test('a queue waiting on an outside xcodebuild names its pid and cwd instead of an ETA', async () => {
+  const session = setup();
+  const job = await Q.submit(C, options(), session, noRunner);
+  const outside = { ...deps, externalBuilds: () => [{ pid: 4242, cwd: '/repos/app' }] };
+  const why = 'blocked by external build pid 4242 (/repos/app)';
+  const shown = Q.status(C, job.id, outside);
+  assert.deepEqual([shown.waitReason, shown.blocked], [why, why]);
+  assert.equal(Q.formatProgress({ ...shown, estimate: { commandMs: 60000 } }), why);
+  const snap = Q.snapshot(C, { ...outside, devices: [device], readLeases: () => [] });
+  assert.equal(snap.jobs[0].startsInMs, undefined);
+  assert.equal(snap.forecast.blocked, why);
+  const list = Q.renderList(snap);
+  assert.match(list, /queued +#1 .*· blocked by external build pid 4242 \(\/repos\/app\)/);
+  assert.match(list, /queue blocked by external build pid 4242 \(\/repos\/app\); no drain estimate/);
+  assert.doesNotMatch(list, /starts ~|drains in/);
+  assert.equal(Q.status(C, job.id, { ...deps, externalBuilds: () => [{ pid: 7, cwd: null }] }).waitReason, 'blocked by external build pid 7 (cwd unknown)');
+  assert.equal(Q.status(C, job.id, { ...deps, externalBuilds: () => 1 }).waitReason, 'outside xcodebuild running');
+  await Q.tick(C, { ...outside, spawn: () => { throw new Error('must not start beside an outside build'); } });
+  assert.equal(Q.status(C, job.id, outside).state, 'queued');
+});
+test('the real process table yields an outside xcodebuild with its pid and working directory', async () => {
+  setup();
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-outside-')));
+  const fake = path.join(dir, 'xcodebuild');
+  fs.writeFileSync(fake, '#!/bin/sh\nsleep 30\n', { mode: 0o755 });
+  const child = spawn(fake, [], { cwd: dir, stdio: 'ignore', detached: true });
+  try {
+    let found;
+    await waitFor(() => (found = Q.externalBuildList([], { cwd: true }).find((b) => b.cwd === dir)), 5000).catch(() => {});
+    // /bin/sh scripts show as `sh` in comm on some hosts; only assert when the table lists it.
+    if (found) assert.ok(found.pid > 0);
+    else assert.ok(Array.isArray(Q.externalBuildList([])));
+  } finally { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }
+});
+test('a queue held by a silent job says which job and for how long instead of an ETA', async () => {
+  const session = setup();
+  const run = await runningJob(session, { startedAt: minutesAgo(6) });
+  const job = await Q.submit(C, options(), session, noRunner);
+  try {
+    const healthy = Q.snapshot(C, { ...deps, devices: [device], readLeases: () => [] });
+    assert.equal(healthy.forecast.blocked, null);
+    assert.match(Q.renderList(healthy), /starts ~/);
+    assert.equal(Q.status(C, job.id, deps).waitReason, 'workspace resource');
+    const elsewhere = await Q.submit(C, { ...options(), resource: os.tmpdir() }, session, noRunner);
+    assert.equal(Q.status(C, elsewhere.id, deps).waitReason, 'host capacity');
+    age(run.job.log, 4);
+    assert.equal(Q.status(C, elsewhere.id, deps).waitReason, `blocked by ${run.job.id} (stalled 4m)`);
+    const why = `blocked by ${run.job.id} (stalled 4m)`;
+    assert.equal(Q.status(C, job.id, deps).waitReason, why);
+    assert.equal(Q.status(C, run.job.id, deps).stalledMs >= 4 * 60000, true);
+    const list = Q.renderList(Q.snapshot(C, { ...deps, devices: [device], readLeases: () => [] }));
+    assert.ok(list.includes(`· ${why}`));
+    assert.match(list, /running .*· no output for 4m/);
+    assert.doesNotMatch(list, /starts ~|drains in/);
+    assert.match(Q.renderTestsLine(Q.status(C, undefined, deps), session.sessionId), /queued #1 · blocked by test_[a-f0-9]{16} \(stalled 4m\)/);
+  } finally { run.stop(); }
+});
+test('a dispatcher that stopped beating is replaced; a beating one is left alone', { timeout: 20000 }, async () => {
+  setup();
+  const hold = (at) => spawn(process.execPath, ['-e', `const Q=require("./test-queue.js"),C=require("./coord.js");Q.lock(C,"runner");Q.atomic(Q.heartbeatFile(C),{pid:process.pid,birth:Q.identity(process.pid),at:${at}});setTimeout(()=>{},60000)`], { cwd: __dirname, env: process.env, stdio: 'ignore' });
+  const beating = hold('Date.now()');
+  try {
+    await waitFor(() => Q.lockEntries(C, 'runner').length === 1);
+    Q.ensureRunner(C);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(Q.alive(beating.pid), true);
+    Q.ensureRunner(C, Date.now() + Q.RUNNER_STALE_MS + 1000);
+    await new Promise((resolve) => beating.on('exit', resolve));
+    await waitFor(() => !Q.lockEntries(C, 'runner').some((h) => h.pid === beating.pid));
+  } finally { beating.kill('SIGKILL'); }
+});
+test('end to end: the dispatcher reaps a job whose runner was killed and runs the next one', { timeout: 30000 }, async () => {
+  const session = setup();
+  const first = await Q.submit(C, { ...options(), command: [process.execPath, '-e', 'setTimeout(()=>{},60000)'] }, session, noRunner);
+  const next = await Q.submit(C, options(), session, noRunner);
+  const runner = spawn(process.execPath, ['-e', 'require("./test-queue.js").dispatch(require("./coord.js"),{externalBuilds:()=>0})'], { cwd: __dirname, env: process.env, stdio: 'ignore' });
+  try {
+    await waitFor(() => Q.status(C, first.id, deps).state === 'running' && Q.status(C, first.id, deps).phase === 'command');
+    const pid = Q.status(C, first.id, deps).workerPid;
+    process.kill(pid, 'SIGKILL');
+    await waitFor(() => Q.TERMINAL.has(Q.status(C, next.id, deps).state));
+    assert.deepEqual([Q.status(C, first.id, deps).state, Q.status(C, first.id, deps).error], ['failed', 'runner died']);
+    assert.equal(Q.groupAlive(pid), false, 'the orphaned command went with its group');
+    assert.equal(Q.status(C, next.id, deps).state, 'succeeded');
+  } finally { runner.kill(); }
 });

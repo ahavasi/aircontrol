@@ -6,8 +6,10 @@ const { spawn, execFileSync } = require('child_process');
 const os = require('os');
 
 const ACTIVE = new Set(['starting', 'running', 'cleaning']);
-const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'blocked']);
-const DEFAULTS = { enabled: false, overlap: false, maxXcode: 1, maxSimulators: 1, jobs: 4, jobsSolo: null, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'], bootTimeoutMs: 5 * 60 * 1000 };
+const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'blocked', 'timed_out']);
+const KINDS = ['build', 'ios-test', 'ios-test-only'];
+const MAX_RUN_MS = { build: 20 * 60 * 1000, 'ios-test': 45 * 60 * 1000, 'ios-test-only': 45 * 60 * 1000 };
+const DEFAULTS = { stallTimeoutMs: 10 * 60 * 1000, maxRunMs: MAX_RUN_MS, enabled: false, overlap: false, maxXcode: 1, maxSimulators: 1, jobs: 4, jobsSolo: null, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'], bootTimeoutMs: 5 * 60 * 1000 };
 const simulatorJob = (kind) => ['ios-test', 'ios-test-only'].includes(kind);
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const root = (C) => path.join(path.dirname(C.configFile()), 'test-jobs');
@@ -25,8 +27,13 @@ function atomic(name, value) {
 function config(C) {
   const result = { ...DEFAULTS, ...(readJson(C.configFile()) || {}).testing };
   if (typeof result.overlap !== 'boolean') throw new Error('testing.overlap must be boolean');
-  for (const key of ['maxXcode', 'maxSimulators', 'jobs', 'bootTimeoutMs']) {
+  for (const key of ['maxXcode', 'maxSimulators', 'jobs', 'bootTimeoutMs', 'stallTimeoutMs']) {
     if (!Number.isInteger(result[key]) || result[key] < 1) throw new Error('testing.' + key + ' must be a positive integer');
+  }
+  if (!result.maxRunMs || typeof result.maxRunMs !== 'object' || Array.isArray(result.maxRunMs)) throw new Error('testing.maxRunMs must map a job kind to milliseconds');
+  result.maxRunMs = { ...MAX_RUN_MS, ...result.maxRunMs };
+  for (const [kind, ms] of Object.entries(result.maxRunMs)) {
+    if (!KINDS.includes(kind) || !Number.isInteger(ms) || ms < 1) throw new Error('testing.maxRunMs.' + kind + ' must be a positive integer for a known job kind');
   }
   if (result.jobsSolo === null || result.jobsSolo === undefined) result.jobsSolo = Math.max(result.jobs, os.cpus().length - 2);
   else if (!Number.isInteger(result.jobsSolo) || result.jobsSolo < 1) throw new Error('testing.jobsSolo must be a positive integer');
@@ -59,6 +66,52 @@ let selfBirth;
 function groupAlive(pid) {
   if (!pid) return false;
   try { process.kill(-pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; }
+}
+// A recycled pid can lead someone else's process group. The job's own group is gone then, so it
+// must read as dead: signalling it would hit a stranger and waiting on it would never end.
+function jobGroupAlive(job) {
+  if (!groupAlive(job.workerPid)) return false;
+  const current = identity(job.workerPid);
+  return !current || !job.workerBirth || current === job.workerBirth;
+}
+// One `ps` per check. A failed or slow `ps` reads as alive: reaping a healthy job because the
+// host was too busy to answer is worse than waiting one more tick.
+function runnerAlive(job, deps = {}) {
+  if (deps.runnerAlive) return deps.runnerAlive(job);
+  const pid = job.workerPid;
+  if (!Number.isInteger(pid) || pid < 1) return false;
+  try { process.kill(pid, 0); } catch (e) { if (e.code !== 'EPERM') return false; }
+  let out;
+  try { out = execFileSync('ps', ['-p', String(pid), '-o', 'stat=,lstart='], { encoding: 'utf8', timeout: 3000 }).trim(); } catch (e) { return e.status !== 1; }
+  const match = out.match(/^(\S+)\s+(.*)$/);
+  if (!match) return true;
+  if (match[1].startsWith('Z')) return false;
+  return !job.workerBirth || match[2].trim() === job.workerBirth;
+}
+const cancelFile = (C, id) => path.join(root(C), id + '.cancel');
+const reapFile = (C, id) => path.join(root(C), id + '.reap');
+// Output counts wherever the runner sends it: its own log, or the one its phase file names.
+function lastOutputAt(C, job) {
+  const phase = path.join(root(C), job.id + '.phase.json');
+  const named = readJson(phase)?.log;
+  let at = Math.max(job.startedAt || 0, job.commandStartedAt || 0);
+  for (const name of [job.log, phase, typeof named === 'string' && path.isAbsolute(named) ? named : null]) {
+    if (name) try { at = Math.max(at, fs.statSync(name).mtimeMs); } catch {}
+  }
+  return at || null;
+}
+const NEVER_STARTED_MS = 60 * 1000;
+// Why a started job can no longer be trusted to finish by itself, or null while it can.
+function liveness(C, cfg, job, now = Date.now(), deps = {}) {
+  if (job.state !== 'starting' && job.state !== 'running') return null;
+  if (!job.workerPid) return job.startedAt && now - job.startedAt > NEVER_STARTED_MS ? { state: 'failed', reason: 'runner died' } : null;
+  if (!runnerAlive(job, deps)) return { state: 'failed', reason: 'runner died' };
+  const last = lastOutputAt(C, job);
+  const silentMs = last ? now - last : 0;
+  if (silentMs > cfg.stallTimeoutMs) return { state: 'timed_out', reason: `no log output for ${formatDuration(silentMs)} (limit ${formatDuration(cfg.stallTimeoutMs)})` };
+  const cap = cfg.maxRunMs[job.kind];
+  if (cap && job.startedAt && now - job.startedAt > cap) return { state: 'timed_out', reason: `${job.kind} ran past its ${formatDuration(cap)} limit` };
+  return null;
 }
 function lockEntries(C, name) {
   fs.mkdirSync(root(C), { recursive: true });
@@ -133,16 +186,36 @@ function activeLease(C, lease) {
 function manualLeases(C, owner) {
   return C.readLeases().filter((s) => s.platform === 'ios' && !s.jobId && (!owner || s.sessionId !== owner));
 }
-function externalBuilds(existing = []) {
+function processCwd(pid) {
+  try {
+    return execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8', timeout: 3000 })
+      .split('\n').find((s) => s.startsWith('n'))?.slice(1) || null;
+  } catch { return null; }
+}
+// xcodebuild processes the queue did not start. An unanswered `ps` reports one unknown build,
+// so the lane stays closed rather than double-booking the host.
+function externalBuildList(existing = [], opts = {}) {
   try {
     const groups = new Set(existing.filter((j) => ACTIVE.has(j.state)).map((j) => j.workerPid));
-    return execFileSync('ps', ['-axo', 'pgid=,comm='], { encoding: 'utf8', timeout: 3000 }).split('\n')
-      .filter((s) => { const match = s.trim().match(/^(\d+)\s+(.*)$/); return match && !groups.has(Number(match[1])) && /(?:^|\/)xcodebuild$/.test(match[2]); }).length;
-  } catch { return 1; }
+    const found = execFileSync('ps', ['-axo', 'pgid=,pid=,comm='], { encoding: 'utf8', timeout: 3000 }).split('\n')
+      .map((s) => s.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
+      .filter((m) => m && !groups.has(Number(m[1])) && /(?:^|\/)xcodebuild$/.test(m[3]))
+      .map((m) => ({ pid: Number(m[2]), cwd: null }));
+    if (opts.cwd && found.length) found[0].cwd = processCwd(found[0].pid);
+    return found;
+  } catch { return [{ pid: null, cwd: null }]; }
+}
+function externalBuilds(existing = []) { return externalBuildList(existing).length; }
+function externalBlock(external) {
+  if (!Array.isArray(external)) return external > 0 ? 'outside xcodebuild running' : null;
+  if (!external.length) return null;
+  const first = external.find((b) => b.pid) || external[0];
+  return first.pid ? `blocked by external build pid ${first.pid} (${first.cwd || 'cwd unknown'})` : 'outside xcodebuild running';
 }
 function capacityBlock(C, cfg, existing, kind, external = externalBuilds(existing), owner) {
   const active = existing.filter((j) => ACTIVE.has(j.state));
-  if (external > 0) return 'outside xcodebuild running';
+  const outside = externalBlock(external);
+  if (outside) return outside;
   if (cfg.overlap) {
     if (kind !== 'ios-test-only' && active.some((j) => j.kind !== 'ios-test-only')) return 'host capacity';
     if (simulatorJob(kind) && active.some((j) => simulatorJob(j.kind))) return 'host capacity';
@@ -191,9 +264,20 @@ function maintenanceActive(C) {
   const owner = readJson(path.join(root(C), 'maintenance.json'));
   return !!owner && alive(owner.pid, owner.birth);
 }
-function ensureRunner(C) {
+// A dispatcher that holds the runner lock but stopped looping would leave every reaped or
+// finished job uncollected, so one that has not beaten for this long is replaced.
+const RUNNER_STALE_MS = 5 * 60 * 1000;
+const heartbeatFile = (C) => path.join(root(C), 'runner.json');
+function ensureRunner(C, now = Date.now()) {
   if (maintenanceActive(C)) return;
-  if (lockEntries(C, 'runner').length) return;
+  const held = lockEntries(C, 'runner');
+  if (held.length) {
+    const beat = readJson(heartbeatFile(C));
+    const hung = beat && now - beat.at > RUNNER_STALE_MS && held.some((h) => h.pid === beat.pid) && alive(beat.pid, beat.birth);
+    if (!hung) return;
+    try { process.kill(beat.pid, 'SIGKILL'); } catch {}
+    for (const h of held.filter((h) => h.pid === beat.pid)) fs.rmSync(h.target, { force: true });
+  }
   const child = spawn(process.execPath, [path.join(__dirname, 'test-queue.js'), 'dispatch'], {
     detached: true, stdio: 'ignore', env: process.env,
   });
@@ -257,41 +341,76 @@ function status(C, id, deps = {}) {
   const history = readJson(historyFile(C));
   const waiting = all.filter((j) => j.state === 'queued');
   const cfg = config(C);
-  const external = deps.externalBuilds ? deps.externalBuilds() : externalBuilds(all);
-  const result = all.filter((j) => !id || (pipeline ? j.pipelineId === id : j.id === id)).map((j) => ({ ...j,
-    waitReason: j.state === 'queued' ? waitReason(C, cfg, all, j, external) || 'scheduler turn' : null,
+  const external = deps.externalBuilds ? deps.externalBuilds() : externalBuildList(all, { cwd: true });
+  const now = Date.now();
+  // Quiet for a quarter of the stall limit is long enough that an ETA built on it would be a guess.
+  const quiet = new Map();
+  for (const j of all.filter((x) => ACTIVE.has(x.state))) {
+    const last = lastOutputAt(C, j);
+    if (last && now - last >= cfg.stallTimeoutMs / 4) quiet.set(j.id, now - last);
+  }
+  const blockedBy = (job, reason) => {
+    if (reason && reason.startsWith('blocked by ')) return reason;
+    if (reason !== 'host capacity' && reason !== 'workspace resource') return null;
+    const holders = all.filter((x) => quiet.has(x.id) && (reason === 'host capacity' || (x.resource || x.cwd) === job.resource));
+    const worst = holders.sort((a, b) => quiet.get(b.id) - quiet.get(a.id))[0];
+    return worst ? `blocked by ${worst.id} (stalled ${formatDuration(quiet.get(worst.id))})` : null;
+  };
+  const result = all.filter((j) => !id || (pipeline ? j.pipelineId === id : j.id === id)).map((j) => {
+    const reason = j.state === 'queued' ? waitReason(C, cfg, all, j, external) : null;
+    const blocked = blockedBy(j, reason);
+    return { ...j,
+    waitReason: j.state === 'queued' ? blocked || reason || 'scheduler turn' : null,
+    blocked,
+    ...(ACTIVE.has(j.state) ? { runnerPid: j.workerPid || null, lastOutputAt: lastOutputAt(C, j), stalledMs: quiet.get(j.id) ?? null } : {}),
     ...(j.state === 'running' && j.phase === 'command' ? { phase: readJson(path.join(root(C), j.id + '.phase.json'))?.phase || j.phase,
       progress: readJson(path.join(root(C), j.id + '.progress.json')) || j.progress || null } : {}),
     estimate: ACTIVE.has(j.state) || j.state === 'queued' ? estimate(j, history) : null,
     queuePosition: j.state === 'queued' ? waiting.findIndex((w) => w.id === j.id) + 1 : null,
     elapsedMs: j.startedAt ? (j.finishedAt || Date.now()) - j.startedAt : 0,
     slow: ACTIVE.has(j.state) && Date.now() - j.startedAt > 15 * 60 * 1000,
-  }));
+  }; });
   if (id && !result.length) throw new Error('test job not found');
   return id && !pipeline ? result[0] : result;
 }
-async function cancel(C, id, owner) {
+// The owner may always cancel. Anyone may cancel a job that fails the liveness check, since its
+// owner is often the session that went quiet with it. --force covers the rest and is recorded.
+async function cancel(C, id, owner, opts = {}) {
+  const by = { sessionId: owner, name: C.friendlyName?.(owner) || owner };
   const result = await withLock(C, () => {
+    const now = Date.now();
+    const stop = (job, reason) => {
+      const request = { requestedAt: now, ...(job.owner !== owner ? { by } : {}), ...(reason ? { reason } : {}), ...(opts.force ? { force: true, forcedBy: by } : {}) };
+      atomic(cancelFile(C, job.id), request);
+      if (job.state !== 'queued') return;
+      job.state = 'cancelled'; job.finishedAt = now;
+      applyCancel(job, request);
+      atomic(file(C, job.id), job);
+    };
+    let found;
     if (/^pipeline_[a-f0-9]{16}$/.test(id)) {
-      const members = jobs(C).filter((j) => j.pipelineId === id);
-      if (!members.length) throw new Error('pipeline not found');
-      if (members.some((j) => j.owner !== owner)) throw new Error('only the submitting session can cancel this pipeline');
-      for (const job of members.filter((j) => !TERMINAL.has(j.state))) {
-        atomic(path.join(root(C), job.id + '.cancel'), { requestedAt: Date.now() });
-        if (job.state === 'queued') { job.state = 'cancelled'; job.finishedAt = Date.now(); atomic(file(C, job.id), job); }
-      }
-      return members;
+      found = jobs(C).filter((j) => j.pipelineId === id);
+      if (!found.length) throw new Error('pipeline not found');
+      if (!opts.force && found.some((j) => j.owner !== owner)) throw new Error('only the submitting session can cancel this pipeline (cancel --force overrides and records who forced it)');
+      for (const job of found.filter((j) => !TERMINAL.has(j.state))) stop(job);
+    } else {
+      const job = found = readJson(file(C, id));
+      if (!job) throw new Error('test job not found');
+      const unhealthy = job.owner === owner || opts.force ? null : readJson(reapFile(C, id)) || liveness(C, config(C), job, now, opts.deps);
+      if (job.owner !== owner && !opts.force && !unhealthy) throw new Error('only the submitting session can cancel this job while it is healthy (cancel --force overrides and records who forced it)');
+      if (TERMINAL.has(job.state)) return job;
+      stop(job, unhealthy?.reason);
     }
-    const job = readJson(file(C, id));
-    if (!job) throw new Error('test job not found');
-    if (job.owner !== owner) throw new Error('only the submitting session can cancel this job');
-    if (TERMINAL.has(job.state)) return job;
-    atomic(path.join(root(C), id + '.cancel'), { requestedAt: Date.now() });
-    if (job.state === 'queued') { job.state = 'cancelled'; job.finishedAt = Date.now(); atomic(file(C, id), job); }
-    return job;
+    sweep(C, opts.deps);
+    return Array.isArray(found) ? found.map((j) => readJson(file(C, j.id)) || j) : readJson(file(C, id)) || found;
   });
-  ensureRunner(C);
+  (opts.deps?.ensureRunner || (() => ensureRunner(C)))();
   return result;
+}
+function applyCancel(job, request) {
+  if (request?.by) job.cancelledBy = request.by;
+  if (request?.forcedBy) job.forcedBy = request.forcedBy;
+  if (request?.reason) job.error = 'cancelled: ' + request.reason;
 }
 function validateCommand(argv, kind, cwd, cfg) {
   if (path.basename(argv[0]) === 'xcodebuild') {
@@ -474,10 +593,12 @@ function formatProgress(j, now = Date.now()) {
     else if (p.unit.done) parts.push(`${p.unit.done}${j.estimate?.unit ? '/' + j.estimate.unit : ''} unit`);
     if (!ui && !p.unit.done && !p.unit.total && p.build) parts.push(`build ${p.build}`);
   }
-  if (ACTIVE.has(j.state) || j.state === 'queued') {
+  if (j.state === 'queued' && j.blocked) parts.push(j.blocked);
+  else if (ACTIVE.has(j.state) || j.state === 'queued') {
     const left = remainingMs(j, now);
     if (left !== null) parts.push(left > 0 ? `~${formatDuration(left)} left` : 'running over estimate');
   }
+  if (ACTIVE.has(j.state) && j.stalledMs) parts.push(`no output for ${formatDuration(j.stalledMs)}`);
   return parts.join(' · ');
 }
 const PHASES = { starting: 'starting', boot: 'booting simulator', build: 'building', command: 'running', test: 'testing', cleanup: 'cleaning up' };
@@ -634,7 +755,7 @@ function signalJob(job, signal) {
   process.kill(-job.workerPid, signal);
 }
 function cleanup(C, job, deps = {}) {
-  if (groupAlive(job.workerPid)) return false;
+  if (jobGroupAlive(job)) return false;
   job.state = 'cleaning';
   job.phase = 'cleanup';
   const begin = Date.now();
@@ -651,31 +772,57 @@ function cleanup(C, job, deps = {}) {
     if (!result.ok && !unhealthyDevices(C)[job.device.key]) { job.error = 'cleanup pending: ' + result.error; atomic(file(C, job.id), job); return false; }
     if (lease) C.releaseLease('ios', job.device.key);
   }
-  job.timings.cleanupMs = Date.now() - begin;
+  (job.timings ||= {}).cleanupMs = Date.now() - begin;
   job.finishedAt = Date.now();
-  job.state = fs.existsSync(path.join(root(C), job.id + '.cancel')) ? 'cancelled' : job.result || 'failed';
-  if (!job.result && job.state !== 'cancelled') job.error = 'test runner exited without a result';
+  const cancelled = fs.existsSync(cancelFile(C, job.id));
+  // A command that finished in the instant it was being reaped still succeeded.
+  const mark = cancelled || job.result === 'succeeded' ? null : readJson(reapFile(C, job.id));
+  job.state = cancelled ? 'cancelled' : mark ? mark.state : job.result || 'failed';
+  if (cancelled) applyCancel(job, readJson(cancelFile(C, job.id)));
+  else if (mark) { job.error = mark.reason; job.reapedAt = mark.at; }
+  else if (!job.result) job.error = 'test runner exited without a result';
   atomic(file(C, job.id), job);
   return true;
 }
+// Stops and collects every started job that was cancelled or can no longer finish by itself:
+// its process group is killed, its simulator lease released by the ordinary cleanup, and the
+// lane handed on. Caller holds the queue lock.
+function sweep(C, deps = {}) {
+  const cfg = config(C);
+  const now = Date.now();
+  for (let job of jobs(C).filter((j) => ACTIVE.has(j.state))) {
+    const request = readJson(cancelFile(C, job.id));
+    let mark = readJson(reapFile(C, job.id));
+    if (!request && !mark) {
+      const verdict = liveness(C, cfg, job, now, deps);
+      // A worker writes 'cleaning' before it exits, so a second read tells finished from dead.
+      const fresh = verdict ? readJson(file(C, job.id)) : null;
+      if (fresh && (fresh.state === 'starting' || fresh.state === 'running')) {
+        mark = { ...verdict, at: now, runnerPid: job.workerPid || null };
+        atomic(reapFile(C, job.id), mark);
+      }
+    }
+    if ((request || mark) && jobGroupAlive(job)) {
+      const hard = mark || request.force || now - request.requestedAt > 10000;
+      try { signalJob(job, hard ? 'SIGKILL' : 'SIGTERM'); } catch (e) { job.error = e.message; atomic(file(C, job.id), job); }
+    }
+    if (!jobGroupAlive(job)) cleanup(C, readJson(file(C, job.id)) || job, deps);
+  }
+}
+async function reap(C, deps = {}) {
+  try { await withLock(C, () => sweep(C, deps)); } catch (e) { if (e.code !== 'AIRCONTROL_QUEUE_BUSY') throw e; }
+}
 async function tick(C, deps = {}) {
   return withLock(C, () => {
+    sweep(C, deps);
     let all = jobs(C);
-    for (const job of all.filter((j) => ACTIVE.has(j.state))) {
-      const request = readJson(path.join(root(C), job.id + '.cancel'));
-      if (request && groupAlive(job.workerPid)) {
-        try { signalJob(job, Date.now() - request.requestedAt > 10000 ? 'SIGKILL' : 'SIGTERM'); } catch (e) { job.error = e.message; atomic(file(C, job.id), job); }
-      }
-      if (!groupAlive(job.workerPid)) cleanup(C, job, deps);
-    }
-    all = jobs(C);
     if (!config(C).enabled) return;
     for (const pending of all.filter((j) => j.state === 'queued')) {
       if (dependencyState(pending, all) !== 'failed dependency') continue;
       pending.state = 'blocked'; pending.error = 'dependency failed, cancelled or missing'; pending.finishedAt = Date.now();
       atomic(file(C, pending.id), pending);
     }
-    const job = chooseJob(C, config(C), all, deps.externalBuilds ? deps.externalBuilds() : externalBuilds(all));
+    const job = chooseJob(C, config(C), all, deps.externalBuilds ? deps.externalBuilds() : externalBuildList(all));
     if (!job) return;
     job.state = 'starting'; job.phase = 'starting'; job.startedAt = Date.now();
     job.timings = { queueMs: job.startedAt - job.submittedAt };
@@ -709,6 +856,7 @@ async function dispatch(C, deps = {}) {
   if (!release) return;
   try {
     while (true) {
+      try { atomic(heartbeatFile(C), { pid: process.pid, birth: selfBirth ||= identity(process.pid), at: Date.now() }); } catch {}
       try { await tick(C, deps); } catch (e) { if (e.code !== 'AIRCONTROL_QUEUE_BUSY') throw e; }
       writeStatusline(C);
       const pending = jobs(C).some((j) => j.state === 'queued' || ACTIVE.has(j.state));
@@ -752,7 +900,7 @@ function viewJob(j, now) {
     id: j.id, label: jobLabel(j), pipelineId: j.pipelineId || null, ownerName: j.ownerName, kind: j.kind, state: j.state,
     phase: j.phase || null, phaseLabel: j.state === 'queued' ? 'queued' : TERMINAL.has(j.state) ? j.state : phaseLabel(j.phase || j.state),
     priority: j.priority, group: verifyGroup(j),
-    queuePosition: j.queuePosition, waitReason: j.waitReason, worktree: j.cwd ? path.basename(j.cwd) : null,
+    queuePosition: j.queuePosition, waitReason: j.waitReason, blocked: j.blocked || null, stalledMs: j.stalledMs ?? null, worktree: j.cwd ? path.basename(j.cwd) : null,
     device: j.device ? { name: j.device.name, key: j.device.key } : null, submittedAt: j.submittedAt, startedAt: j.startedAt || null,
     commandStartedAt: j.commandStartedAt || null, finishedAt: j.finishedAt || null, elapsedMs: j.elapsedMs, slow: !!j.slow,
     estimateMs: j.estimate?.commandMs ?? null, remainingMs: remainingMs(j, now), progress: j.progress || null,
@@ -803,7 +951,7 @@ function forecast(cfg, view, records, now) {
 function snapshot(C, deps = {}) {
   const now = deps.now || Date.now();
   const cfg = config(C);
-  const records = status(C);
+  const records = status(C, undefined, deps);
   const all = records.filter((j) => !TERMINAL.has(j.state) || now - (j.finishedAt || 0) < RECENT_MS)
     .sort((a, b) => rank(a) - rank(b) || (rank(a) === 2 ? (b.finishedAt || 0) - (a.finishedAt || 0) : a.sequence - b.sequence)).map((j) => viewJob(j, now));
   const pipelines = [];
@@ -826,8 +974,10 @@ function snapshot(C, deps = {}) {
       jobId: lease?.jobId || null, purpose: lease?.purpose || null, unhealthy: benched[d.key] || null };
   });
   const outlook = forecast(cfg, all, records, now);
-  for (const j of all) if (outlook.jobs[j.id]) Object.assign(j, outlook.jobs[j.id]);
-  const { jobs: _perJob, ...queue } = outlook;
+  // A start time behind a blocker nobody can date would be invented, so those jobs get none.
+  const blocked = all.find((j) => j.state === 'queued' && j.blocked)?.blocked || null;
+  for (const j of all) if (outlook.jobs[j.id] && !blocked) Object.assign(j, outlook.jobs[j.id]);
+  const { jobs: _perJob, ...queue } = { ...outlook, blocked };
   return { at: now, config: { enabled: cfg.enabled, overlap: cfg.overlap, maxXcode: cfg.maxXcode, maxSimulators: cfg.maxSimulators, bootTimeoutMs: cfg.bootTimeoutMs },
     jobs: all, pipelines, devices, unhealthy: Object.values(benched), forecast: queue };
 }
@@ -861,7 +1011,8 @@ function renderList(snap) {
   const lines = snap.jobs.map((j) => [j.id, j.state.padEnd(9), (j.state === 'queued' ? '#' + j.queuePosition : j.phaseLabel).padEnd(18),
     j.ownerName.padEnd(22), j.label.padEnd(28), j.worktree || '-', j.progressText ? '· ' + j.progressText : '',
     j.state === 'queued' && j.startsInMs !== undefined ? '· starts ~' + formatDuration(j.startsInMs) : ''].join(' '));
-  if (snap.forecast && snap.jobs.some((j) => j.state === 'queued' || ACTIVE.has(j.state))) {
+  if (snap.forecast?.blocked) lines.push(`queue ${snap.forecast.blocked}; no drain estimate until it clears`);
+  else if (snap.forecast && snap.jobs.some((j) => j.state === 'queued' || ACTIVE.has(j.state))) {
     lines.push(`queue drains in ~${formatDuration(snap.forecast.drainMs)} (${new Date(snap.forecast.finishAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` +
       (snap.forecast.unknownEstimates ? ` · ${snap.forecast.unknownEstimates} job${snap.forecast.unknownEstimates === 1 ? '' : 's'} without history, estimated from similar runs` : ''));
   }
@@ -937,8 +1088,17 @@ async function cli(C, argv) {
       if (!['true', 'false'].includes(args.enabled)) throw new Error('--enabled must be true or false');
       testing.enabled = args.enabled === 'true';
     }
-    for (const [flag, key] of [['max-xcode', 'maxXcode'], ['max-simulators', 'maxSimulators'], ['jobs', 'jobs'], ['jobs-solo', 'jobsSolo'], ['boot-timeout-ms', 'bootTimeoutMs']]) {
+    for (const [flag, key] of [['max-xcode', 'maxXcode'], ['max-simulators', 'maxSimulators'], ['jobs', 'jobs'], ['jobs-solo', 'jobsSolo'], ['boot-timeout-ms', 'bootTimeoutMs'], ['stall-timeout-ms', 'stallTimeoutMs']]) {
       if (args[flag] !== undefined) { const n = Number(args[flag]); if (!Number.isInteger(n) || n < 1) throw new Error('invalid --' + flag); testing[key] = n; }
+    }
+    if (args['max-run-ms'] !== undefined) {
+      testing.maxRunMs = { ...testing.maxRunMs };
+      for (const pair of String(args['max-run-ms']).split(',')) {
+        const [kind, value] = pair.split('=');
+        const n = Number(value);
+        if (!KINDS.includes(kind) || !Number.isInteger(n) || n < 1) throw new Error('--max-run-ms takes kind=milliseconds pairs, e.g. build=1200000,ios-test=2700000');
+        testing.maxRunMs[kind] = n;
+      }
     }
     if (args.overlap !== undefined) {
       if (!['true', 'false'].includes(args.overlap)) throw new Error('--overlap must be true or false');
@@ -952,6 +1112,7 @@ async function cli(C, argv) {
   } else if (sub === 'status') {
     const id = args._[2];
     if (id && !/^pipeline_[a-f0-9]{16}$/.test(id)) file(C, id);
+    await reap(C);
     result = status(C, id); ensureRunner(C);
   } else if (sub === 'report') {
     const days = args.days === undefined ? 7 : Number(args.days);
@@ -959,6 +1120,7 @@ async function cli(C, argv) {
     const r = report(C, { days });
     console.log(args.json ? JSON.stringify(r) : renderReport(r)); return;
   } else if (sub === 'list') {
+    await reap(C);
     const snap = snapshot(C); ensureRunner(C);
     console.log(args.json ? JSON.stringify(snap) : renderList(snap)); return;
   } else if (sub === 'line') {
@@ -972,19 +1134,24 @@ async function cli(C, argv) {
     return;
   } else {
     const session = C.requireLiveSession(args, Date.now());
+    if (sub === 'submit' || sub === 'pipeline') await reap(C);
     if (sub === 'pipeline') {
       result = await submitPipeline(C, JSON.parse(fs.readFileSync(args.file, 'utf8')), session);
       console.log(JSON.stringify(result)); return;
     }
     if (sub === 'submit') result = await submit(C, { kind: args.kind, cwd: args.cwd, name: args.name,
       runtime: args.runtime, bundleId: args['bundle-id'], priority: args.priority, resource: args.resource, dependsOn: args['depends-on'] ? args['depends-on'].split(',') : [], command: separator < 0 ? [] : argv.slice(separator + 1) }, session);
-    else if (sub === 'cancel') result = await cancel(C, args._[2], session.sessionId);
-    else throw new Error('usage: test submit|status|list|line|watch|report|cancel');
+    else if (sub === 'cancel') {
+      // `--force <id>` parses the id as the flag's value.
+      const id = args._[2] || (typeof args.force === 'string' ? args.force : undefined);
+      if (!id) throw new Error('usage: test cancel <job-id> [--force] --session <name>');
+      result = await cancel(C, id, session.sessionId, { force: Boolean(args.force) });
+    } else throw new Error('usage: test submit|status|list|line|watch|report|cancel [--force]');
   }
   if (args.json) console.log(JSON.stringify(result));
-  else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}`);
+  else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}${j.forcedBy ? ' forced-by=' + j.forcedBy.name : ''}`);
 }
-module.exports = { bootDevice, work, execute, unhealthyDevices, markUnhealthy, clearUnhealthy, poolUnhealthy, waitReason, capacityBlock, jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { liveness, runnerAlive, jobGroupAlive, lastOutputAt, sweep, reap, externalBuildList, ensureRunner, heartbeatFile, RUNNER_STALE_MS, bootDevice, work, execute, unhealthyDevices, markUnhealthy, clearUnhealthy, poolUnhealthy, waitReason, capacityBlock, jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);
