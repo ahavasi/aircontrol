@@ -151,25 +151,10 @@ worktrees. For each candidate, in this order:
    information; report it rather than escalating.
 4. Only delete a branch whose worktree was actually removed, with `-d`. Never `-D` one that was
    skipped.
-5. Worktrees that stay but sit idle (no live session, nothing modified in the last few hours) still
-   hold their ignored build output, often several GB each, and `disk --prune` does not look inside
-   registered worktrees. Enumerate every registered worktree, not only the ones this session made
-   or the ones under `.claude/worktrees`: sibling checkouts next to the repo are where the largest
-   build trees sit.
-
-   ```bash
-   git worktree list --porcelain | awk '/^worktree /{print $2}' | while read w; do
-     for d in build/DerivedData DerivedData .gradle build node_modules; do
-       [ -d "$w/$d" ] && echo "$(du -sh "$w/$d" | cut -f1)	$w/$d"
-     done
-   done
-   ```
-
-   For each one over ~100 MB whose worktree no live session holds or claims and that has no file
-   modified in the last two hours (`find <dir> -type f -mmin -120 | head -1` prints nothing),
-   delete the `DerivedData`, `.gradle` and `node_modules` directories; they regenerate on the next
-   build. Inside `build/`, delete only `DerivedData`: logs and notes kept beside it are not build
-   output. Report what was skipped and who holds it.
+5. Worktrees that stay but sit idle still hold their ignored build output, often several GB each.
+   `disk --prune` in the next step takes the DerivedData, SwiftPM, `.next` and `.gradle` dirs in
+   every registered worktree no live session holds, once untouched for 6 hours. It leaves
+   `node_modules` alone; delete that by hand only in a worktree you are removing.
 6. Then reclaim the build output those worktrees and earlier sessions left behind. Xcode never
    deletes a removed worktree's DerivedData, and macOS keeps ended sessions' `/tmp` dirs until
    reboot (several GB each); nothing else will:

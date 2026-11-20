@@ -4003,7 +4003,7 @@ function repoWithWorktrees() {
 
 test('idleWorktrees reports only clean, pushed, idle worktrees with no live session', () => {
   const { main, wt } = repoWithWorktrees();
-  const got = C.idleWorktrees([path.join(main, '.git')], [wt.live], Date.now(), 7 * 86400e3);
+  const got = C.idleWorktrees([path.join(main, '.git')], { claimed: [], roots: [wt.live] }, Date.now(), 7 * 86400e3);
   assert.deepEqual(got.map((w) => w.dir), [wt.pushed]);
   assert.equal(got[0].branch, 'b-pushed');
   assert.ok(got[0].idleDays >= 9);
@@ -4016,6 +4016,77 @@ test('disk reports an idle worktree but --prune never removes it', () => {
   const out = captureStdout(() => C.cmdDisk({ prune: true }, Date.now(), { root: dd, repos: [path.join(main, '.git')] }));
   assert.match(out, new RegExp(`idle worktree\\t.*\\t${wt.pushed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\t\\(b-pushed, clean and pushed`));
   assert.ok(fs.existsSync(wt.pushed));
+});
+
+function worktreeWithBuildOutput() {
+  const { main, wt } = repoWithWorktrees();
+  const now = Date.now();
+  const g = (cwd, args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, stdio: 'pipe' });
+  for (const w of [main, wt.pushed, wt.dirty, wt.live, wt.recent]) fakeTree(path.join(w, 'ios', 'build', 'DerivedData'));
+  fakeTree(path.join(wt.pushed, 'ios', 'build'), ['a.log']);
+  fakeTree(path.join(wt.pushed, 'ios', 'build', 'SourcePackages'), ['workspace-state.json', 'checkouts/p/x']);
+  fakeTree(path.join(wt.pushed, 'web'), ['package.json', '.next/cache/x', 'node_modules/n/x']);
+  fakeTree(path.join(wt.pushed, 'android', '.gradle'), ['8.9/x']);
+  fakeTree(path.join(wt.pushed, 'tracked-dd'));
+  g(wt.pushed, ['add', 'tracked-dd']);
+  g(wt.pushed, ['commit', '-q', '-m', 'tracked build-shaped dir']);
+  for (const w of [main, wt.pushed, wt.dirty, wt.live, wt.recent]) {
+    for (const top of ['ios', 'web', 'android', 'tracked-dd']) {
+      if (fs.existsSync(path.join(w, top))) ageTree(path.join(w, top), now - 12 * 3600e3);
+    }
+  }
+  fs.utimesSync(path.join(wt.recent, 'ios', 'build', 'DerivedData', 'Build', 'x'), new Date(now), new Date(now));
+  return { main, wt, now };
+}
+
+test('worktreeBuildOutput takes idle build output in linked worktrees nobody holds', () => {
+  const { main, wt, now } = worktreeWithBuildOutput();
+  const got = C.worktreeBuildOutput([path.join(main, '.git')], { claimed: [], roots: [wt.live] }, now, 6 * 3600e3).map((s) => s.dir).sort();
+  assert.deepEqual(got, [
+    path.join(wt.dirty, 'ios', 'build', 'DerivedData'),
+    path.join(wt.pushed, 'android', '.gradle'),
+    path.join(wt.pushed, 'ios', 'build', 'DerivedData'),
+    path.join(wt.pushed, 'ios', 'build', 'SourcePackages'),
+    path.join(wt.pushed, 'web', '.next'),
+  ].sort());
+});
+
+test('a session in a parent folder does not hold the worktrees beneath it, a claim does', () => {
+  const { main, wt, now } = worktreeWithBuildOutput();
+  const parent = path.dirname(main);
+  const held = (busy) => C.worktreeBuildOutput([path.join(main, '.git')], busy, now, 6 * 3600e3).some((s) => s.dir.startsWith(wt.pushed + path.sep));
+  assert.ok(held({ claimed: [], roots: [parent, main] }));
+  assert.ok(!held({ claimed: [], roots: [path.join(wt.pushed, 'ios')] }));
+  assert.ok(!held({ claimed: [parent], roots: [] }));
+  const clean = repoWithWorktrees();
+  const idle = C.idleWorktrees([path.join(clean.main, '.git')], { claimed: [], roots: [path.dirname(clean.main), clean.main] }, Date.now(), 7 * 86400e3);
+  assert.ok(idle.some((w) => w.dir === clean.wt.pushed));
+});
+
+test('disk --prune removes worktree build output and keeps the logs beside it', () => {
+  freshDataDir();
+  const { main, wt, now } = worktreeWithBuildOutput();
+  const dd = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-ddwtb-'));
+  const out = captureStdout(() => C.cmdDisk({ prune: true }, now, { root: dd, sessionTmp: dd, buildRoots: [], repos: [path.join(main, '.git')], run: undefined }));
+  assert.match(out, /removed\t.*ios\/build\/DerivedData\t\(worktree build output, idle\)/);
+  assert.ok(!fs.existsSync(path.join(wt.pushed, 'ios', 'build', 'DerivedData')));
+  assert.ok(!fs.existsSync(path.join(wt.pushed, 'web', '.next')));
+  assert.ok(fs.existsSync(path.join(wt.pushed, 'ios', 'build', 'a.log')));
+  assert.ok(fs.existsSync(path.join(wt.pushed, 'web', 'node_modules')));
+  assert.ok(fs.existsSync(path.join(main, 'ios', 'build', 'DerivedData')));
+});
+
+test('staleDerivedData takes a folder with no project path only once it sits idle', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-ddnp-'));
+  const now = Date.now();
+  fakeDerivedData(root, 'App-noplist-old');
+  fakeDerivedData(root, 'App-noplist-new');
+  fakeDerivedData(root, 'ModuleCache.noindex');
+  ageTree(path.join(root, 'App-noplist-old'), now - 48 * 3600e3);
+  ageTree(path.join(root, 'ModuleCache.noindex'), now - 48 * 3600e3);
+  const stale = C.staleDerivedData(root, [], now, 24 * 3600e3);
+  assert.deepEqual(stale.map((s) => path.basename(s.dir)), ['App-noplist-old']);
+  assert.equal(stale[0].workspace, null);
 });
 
 const dumps = (cmd) => C.classifyCommand(cmd).filter((m) => m.kind === 'secret-dump');

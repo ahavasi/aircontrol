@@ -3891,7 +3891,7 @@ function cmdWorktrees(args, nowMs) {
 // leaves its own multi-GB folder behind after the worktree is deleted, and Xcode never
 // collects it. With several sessions cutting worktrees these fill a disk within a day, and
 // a full disk takes every session down at once: no tool can even create its temp dir.
-const DISK_DEFAULTS = { minFreeBytes: 20e9, minFreeRatio: 0.10, sessionIdleMs: 60 * 60 * 1000, buildIdleMs: 24 * 60 * 60 * 1000, looseFileIdleMs: 7 * 24 * 60 * 60 * 1000, worktreeIdleMs: 7 * 24 * 60 * 60 * 1000 };
+const DISK_DEFAULTS = { minFreeBytes: 20e9, minFreeRatio: 0.10, sessionIdleMs: 60 * 60 * 1000, buildIdleMs: 24 * 60 * 60 * 1000, looseFileIdleMs: 7 * 24 * 60 * 60 * 1000, worktreeIdleMs: 7 * 24 * 60 * 60 * 1000, worktreeBuildIdleMs: 6 * 60 * 60 * 1000 };
 
 function diskThresholds() {
   const out = { ...DISK_DEFAULTS };
@@ -3904,6 +3904,7 @@ function diskThresholds() {
     if (Number.isFinite(d.buildIdleMs) && d.buildIdleMs >= 0) out.buildIdleMs = d.buildIdleMs;
     if (Number.isFinite(d.looseFileIdleMs) && d.looseFileIdleMs >= 0) out.looseFileIdleMs = d.looseFileIdleMs;
     if (Number.isFinite(d.worktreeIdleMs) && d.worktreeIdleMs >= 0) out.worktreeIdleMs = d.worktreeIdleMs;
+    if (Number.isFinite(d.worktreeBuildIdleMs) && d.worktreeBuildIdleMs >= 0) out.worktreeBuildIdleMs = d.worktreeBuildIdleMs;
   } catch {}
   return out;
 }
@@ -3942,17 +3943,25 @@ function derivedDataWorkspace(dir) {
   } catch { return null; }
 }
 
-/// DerivedData folders whose project no longer exists. A folder with no WorkspacePath is
-/// Xcode's shared module cache or one still being created mid-build, so it is never a
-/// candidate; neither is anything under a path a live session has claimed.
-function staleDerivedData(root, claimedPaths = []) {
+/// DerivedData folders whose project no longer exists, never one under a path a live session
+/// has claimed. A folder with no WorkspacePath is one still being created mid-build or one
+/// whose build died before Xcode wrote it: it qualifies only after sitting idle. Xcode's
+/// shared `*.noindex` caches never do.
+function staleDerivedData(root, claimedPaths = [], nowMs = Date.now(), idleMs = DISK_DEFAULTS.buildIdleMs) {
   let names;
   try { names = fs.readdirSync(root); } catch { return []; }
   const out = [];
   for (const name of names) {
     const dir = path.join(root, name);
     const workspace = derivedDataWorkspace(dir);
-    if (!workspace || fs.existsSync(workspace)) continue;
+    if (!workspace) {
+      if (name.endsWith('.noindex')) continue;
+      try { if (!fs.lstatSync(dir).isDirectory()) continue; } catch { continue; }
+      if (touchedSince(dir, nowMs - idleMs)) continue;
+      out.push({ dir, workspace: null });
+      continue;
+    }
+    if (fs.existsSync(workspace)) continue;
     if (claimedPaths.some((p) => pathsOverlap(workspace, p))) continue;
     out.push({ dir, workspace });
   }
@@ -4088,7 +4097,14 @@ function knownRepos(sessions) {
 /// that exists on no remote, and no git activity for a week. Reported, never removed: a
 /// worktree is somebody's work, not a cache. Build output left inside one (an agent's
 /// `-derivedDataPath build`) is how a forgotten worktree grows to 10 GB.
-function idleWorktrees(repos, busyPaths, nowMs, idleMs = DISK_DEFAULTS.worktreeIdleMs, run = runQuiet) {
+/// A live session holds a worktree when it claims a path overlapping it, or when its root is
+/// that worktree or inside it. A root above it does not count: a session in the main checkout
+/// or in ~/Projects is not using every `.worktrees/*` nested beneath it.
+function worktreeHeld(wt, busy) {
+  return busy.claimed.some((p) => pathsOverlap(wt, p)) || busy.roots.some((r) => boundaryPrefix(wt, r));
+}
+
+function idleWorktrees(repos, busy, nowMs, idleMs = DISK_DEFAULTS.worktreeIdleMs, run = runQuiet) {
   const out = [];
   const seen = new Set();
   for (const repo of repos) {
@@ -4099,7 +4115,7 @@ function idleWorktrees(repos, busyPaths, nowMs, idleMs = DISK_DEFAULTS.worktreeI
     for (const wt of trees.slice(1)) {
       if (seen.has(wt) || !fs.existsSync(wt)) continue;
       seen.add(wt);
-      if (busyPaths.some((p) => pathsOverlap(wt, p))) continue;
+      if (worktreeHeld(wt, busy)) continue;
       if ((run('git', ['-C', wt, 'status', '--porcelain']) ?? 'x').trim()) continue;
       const unpushed = run('git', ['-C', wt, 'rev-list', '--count', 'HEAD', '--not', '--remotes']);
       if (unpushed === null || Number(unpushed.trim()) > 0) continue;
@@ -4115,6 +4131,56 @@ function idleWorktrees(repos, busyPaths, nowMs, idleMs = DISK_DEFAULTS.worktreeI
   return out;
 }
 
+const WORKTREE_BUILD_SKIP = new Set(['.git', 'node_modules', 'Pods']);
+
+/// Build output a few levels into a checkout: DerivedData or SwiftPM roots (an agent's
+/// `-derivedDataPath build/DerivedData`), `.next` beside a package.json, and `.gradle`.
+/// Matched by shape, so the logs and notes agents keep beside them in `build/` stay.
+function buildOutputDirs(root, depth = 4) {
+  const out = [];
+  const walk = (dir, d) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory() || WORKTREE_BUILD_SKIP.has(e.name)) continue;
+      const p = path.join(dir, e.name);
+      if (e.name === '.gradle' || (e.name === '.next' && fs.existsSync(path.join(dir, 'package.json'))) || looksLikeBuildRoot(p)) {
+        out.push(p);
+        continue;
+      }
+      if (d > 1) walk(p, d - 1);
+    }
+  };
+  walk(root, depth);
+  return out;
+}
+
+/// Build output inside linked worktrees that no live session holds or claims, untouched for
+/// the idle window and not tracked by git. Unlike the worktree itself this is a cache: the
+/// next build regenerates it, and one worktree's Xcode build alone runs 5 to 16 GB. The main
+/// checkout is left alone, and so is node_modules, which costs a reinstall to get back.
+function worktreeBuildOutput(repos, busy, nowMs, idleMs = DISK_DEFAULTS.worktreeBuildIdleMs, run = runQuiet) {
+  const out = [];
+  const seen = new Set();
+  for (const repo of repos) {
+    const top = path.basename(repo) === '.git' ? path.dirname(repo) : repo;
+    const listing = run('git', ['-C', top, 'worktree', 'list', '--porcelain']);
+    if (!listing) continue;
+    const trees = listing.split('\n').filter((l) => l.startsWith('worktree ')).map((l) => l.slice(9));
+    for (const wt of trees.slice(1)) {
+      if (seen.has(wt) || !fs.existsSync(wt)) continue;
+      seen.add(wt);
+      if (worktreeHeld(wt, busy)) continue;
+      for (const dir of buildOutputDirs(wt)) {
+        if (touchedSince(dir, nowMs - idleMs)) continue;
+        if ((run('git', ['-C', wt, 'ls-files', '--', path.relative(wt, dir)]) ?? 'x').trim()) continue;
+        out.push({ dir, why: 'worktree build output, idle' });
+      }
+    }
+  }
+  return out;
+}
+
 function cmdDisk(args, nowMs, deps = {}) {
   const usage = diskUsage(deps.volume);
   if (usage) console.log(`free: ${humanGB(usage.free)} of ${humanGB(usage.total)} (${Math.round((usage.free / usage.total) * 100)}%)`);
@@ -4123,18 +4189,21 @@ function cmdDisk(args, nowMs, deps = {}) {
     .filter((s) => !isExpired(s, nowMs))
     .flatMap((s) => ((s.claims && s.claims.paths) || []).map(expandUser));
   const th = diskThresholds();
+  const busy = { claimed, roots: sessions.map((s) => s.worktree).filter(Boolean).map(expandUser) };
+  const repos = deps.repos || knownRepos(sessions);
   const stale = [
-    ...staleDerivedData(deps.root || derivedDataRoot(), claimed)
-      .map((s) => ({ dir: s.dir, label: path.basename(s.dir), why: `${s.workspace} is gone` })),
+    ...staleDerivedData(deps.root || derivedDataRoot(), claimed, nowMs, th.buildIdleMs)
+      .map((s) => ({ dir: s.dir, label: path.basename(s.dir), why: s.workspace ? `${s.workspace} is gone` : 'no project path, idle' })),
     ...staleSessionTmp(deps.sessionTmp || sessionTmpRoot(), new Set(sessions.map((s) => s.sessionId)), nowMs, th.sessionIdleMs)
       .map((s) => ({ ...s, label: s.dir })),
     ...staleBuildRoots(deps.buildRoots || buildTmpRoots(), claimed, nowMs, th.buildIdleMs)
       .map((s) => ({ ...s, label: s.dir })),
     ...staleLooseFiles(deps.buildRoots || buildTmpRoots(), claimed, nowMs, th.looseFileIdleMs)
       .map((s) => ({ ...s, label: `${s.dir}/*` })),
+    ...worktreeBuildOutput(repos, busy, nowMs, th.worktreeBuildIdleMs, deps.run)
+      .map((s) => ({ ...s, label: s.dir })),
   ];
-  const busy = [...claimed, ...sessions.map((s) => s.worktree).filter(Boolean)];
-  const idle = idleWorktrees(deps.repos || knownRepos(sessions), busy, nowMs, th.worktreeIdleMs, deps.run);
+  const idle = idleWorktrees(repos, busy, nowMs, th.worktreeIdleMs, deps.run);
   for (const w of idle) {
     console.log(`idle worktree\t${humanGB(dirBytes(w.dir, deps.run))}\t${w.dir}\t(${w.branch}, clean and pushed, idle ${w.idleDays}d; remove with \`git -C ${w.top} worktree remove ${w.dir}\`)`);
   }
@@ -5392,7 +5461,7 @@ function main() {
 }
 
 module.exports = {
-  renderDiskLine, diskUsage, staleDerivedData, derivedDataWorkspace, cmdDisk, DISK_DEFAULTS,
+  renderDiskLine, diskUsage, staleDerivedData, worktreeBuildOutput, buildOutputDirs, derivedDataWorkspace, cmdDisk, DISK_DEFAULTS,
   staleSessionTmp, staleBuildRoots, staleLooseFiles, touchedSince, idleWorktrees,
   stripQuotedProse,
   boundaryPrefix, pathsOverlap, isStale, isExpired, holdsClaims, mergeClaims, resolveIdPrefix, isSafeComponent,
