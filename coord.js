@@ -1921,8 +1921,8 @@ function runQuiet(file, args) {
 // --- device truth ---
 
 function prettyRuntime(id) {
-  const m = /iOS-(\d+)-(\d+)/.exec(String(id));
-  if (m) return `iOS ${m[1]}.${m[2]}`;
+  const m = /\b(iOS|watchOS|tvOS|xrOS)-(\d+)-(\d+)/.exec(String(id));
+  if (m) return `${m[1]} ${m[2]}.${m[3]}`;
   return String(id).replace('com.apple.CoreSimulator.SimRuntime.', '');
 }
 
@@ -1934,11 +1934,13 @@ function parseSimctlDevices(json) {
     if (!Array.isArray(list)) continue;
     for (const d of list) {
       if (!d || !d.udid || d.isAvailable === false) continue;
+      const pretty = prettyRuntime(runtime);
       out.push({
         platform: 'ios',
+        os: require('./test-queue.js').simOs({ runtime: pretty }),
         key: d.udid,
         name: d.name || d.udid,
-        runtime: prettyRuntime(runtime),
+        runtime: pretty,
         state: String(d.state || '').toLowerCase() === 'booted' ? 'booted' : 'shutdown',
       });
     }
@@ -2220,11 +2222,17 @@ function appInstalled(device, bundleId, run = runQuiet) {
 const SEED_PROBE_LIMIT = 12;
 
 function acquireDevice(opts, deps = {}) {
-  const { sessionId, sessionName, repo, purpose, platform, bundleId, prefer, nowMs, extra } = opts;
+  const { sessionId, sessionName, repo, purpose, bundleId, prefer, nowMs, extra } = opts;
+  // A Watch is a simctl device: it leases under 'ios' so the guard, release and
+  // maxSimulators treat it like any other simulator. Without --platform watchos
+  // only an explicit --name can pick one, so a plain acquire never lands on a Watch.
+  const wantOs = opts.platform === 'watchos' ? 'watchOS' : null;
+  const platform = wantOs ? 'ios' : opts.platform;
   pruneLeases(nowMs, deps, { shutdown: true });
   const Q = require('./test-queue.js');
   const cfg = Q.config(module.exports);
-  const compatible = listDevices(platform, deps).filter((d) =>
+  const osOk = (d) => d.platform !== 'ios' || (wantOs ? Q.simOs(d) === wantOs : Q.simOs(d) === 'iOS' || (prefer && !opts.queuedJob));
+  const compatible = listDevices(platform, deps).filter((d) => osOk(d) &&
     (!opts.runtime || d.runtime === opts.runtime) && (!prefer || d.name.toLowerCase() === String(prefer).toLowerCase()) &&
     (!cfg.enabled || d.platform !== 'ios' || Q.deviceAllowed(d, cfg, { runtime: opts.runtime, name: prefer })));
   if (!compatible.length) return { ok: false, reason: 'no-devices', free: [], held: [] };
@@ -2436,7 +2444,7 @@ function resetSimulator(target, opts = {}, deps = {}) {
   const device = matches.find((d) => benched[d.key]) || matches.find((d) => d.runtime === cfg.runtime) || matches[0];
   if (!device) throw new Error(`no iOS simulator named or keyed "${target}"`);
   if (cfg.protectedDevices.some((s) => s === device.key || s === device.name)) throw new Error(`${device.name} is a protected device; reset it by hand`);
-  if (!benched[device.key] && !cfg.allowedNames.includes(device.name)) throw new Error(`${device.name} is not a test-queue pool device (testing.allowedNames); refusing to erase it`);
+  if (!benched[device.key] && !cfg.allowedNames.includes(device.name) && !cfg.watchNames.includes(device.name)) throw new Error(`${device.name} is not a test-queue pool device (testing.allowedNames or testing.watchNames); refusing to erase it`);
   const lease = readLease('ios', device.key);
   if (lease && (!lease.jobId || Q.activeLease(C, lease))) throw new Error(`${device.name} is leased to ${describeLease(lease, Date.now())}; reset it once that lease ends`);
   if (lease) releaseLease('ios', device.key);
@@ -2459,14 +2467,16 @@ function cmdSim(args, nowMs, deps = {}) {
   if (args.session) {
     try { touchLeases(requireLiveSession(args, nowMs).sessionId, nowMs); } catch {}
   }
-  const platform = args.platform;
-  if (platform && platform !== 'ios' && platform !== 'android') {
-    throw new Error(`unknown --platform "${platform}" (ios|android)`);
+  const platform = args.platform ? String(args.platform).toLowerCase() : args.platform;
+  if (platform && platform !== 'ios' && platform !== 'android' && platform !== 'watchos') {
+    throw new Error(`unknown --platform "${platform}" (ios|watchos|android)`);
   }
 
   if (sub === 'list') {
     pruneLeases(nowMs, deps, { shutdown: true });
-    const devices = listDevices(platform, deps);
+    const Q = require('./test-queue.js');
+    const devices = listDevices(platform === 'watchos' ? 'ios' : platform, deps)
+      .filter((d) => platform !== 'watchos' || Q.simOs(d) === 'watchOS');
     const repo = gitInfo(process.cwd()).repo;
     if (args.json) {
       const leases = readLeases().map((l) => ({ ...l, holder: friendlyName(l.sessionId) }));
@@ -2503,7 +2513,13 @@ function cmdSim(args, nowMs, deps = {}) {
       console.error(`DENIED: no free ${platform || 'device'} to lease.`);
       if (holders.length) console.error(`Held:\n${holders.join('\n')}`);
       if (freeList.length) console.error(`Free but unclaimable (lost the race, retry):\n${freeList.join('\n')}`);
-      if (result.reason === 'no-devices') console.error('No simulators or emulators are installed for that platform.');
+      if (result.reason === 'no-devices') {
+        const cfg = Q.config(module.exports);
+        if (platform === 'watchos' && cfg.enabled) {
+          console.error(`No watchOS simulator in the Watch pool: testing.watchNames=${JSON.stringify(cfg.watchNames)}, testing.watchRuntime=${cfg.watchRuntime ? JSON.stringify(cfg.watchRuntime) : 'any'}.`);
+          console.error('Create one (xcrun simctl create Aircontrol-Agent-Watch <watch device type> <watchOS runtime>) or set the pool with `coord.js test configure --watch-devices <names> [--watch-runtime "watchOS 27.0"]`.');
+        } else console.error('No simulators or emulators are installed for that platform.');
+      }
       process.exitCode = 1;
       return;
     }
@@ -2522,7 +2538,7 @@ function cmdSim(args, nowMs, deps = {}) {
     console.log(`leased ${d.key} (${d.name}, ${d.runtime}, ${d.state})${note}`);
     console.log(`export AIRCONTROL_SIM_UDID=${d.key}`);
     if (d.platform === 'ios') {
-      console.log(`# xcodebuild -destination "platform=iOS Simulator,id=${d.key}"   # never by name: a name runs zero tests`);
+      console.log(`# xcodebuild -destination "platform=${Q.simOs(d)} Simulator,id=${d.key}"   # never by name: a name runs zero tests`);
     }
     return;
   }
@@ -2578,7 +2594,7 @@ function cmdSim(args, nowMs, deps = {}) {
     return;
   }
 
-  throw new Error('usage: coord.js sim <list|acquire|release|reset> [--session id] [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
+  throw new Error('usage: coord.js sim <list|acquire|release|reset> [--session id] [--for purpose] [--platform ios|watchos|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
 }
 
 // ---------- cross-repo work ledger ----------
@@ -5354,7 +5370,7 @@ function main() {
     else {
       console.error('usage: aircontrol <install|uninstall|register|inject|inject-codex|beat|guard|deregister|claim|release|send|who|names|doctor|sim|device|ledger|handoff|cloud|relay|worktrees|disk|browsers|tasks|retro|log|skills|peek|test|dashboard> [--session id] [--intent "…"] [--paths a,b] [--resources r1,r2] [--to id|all] [--roots dir1,dir2] [--repair] [message]');
       console.error('       coord.js skills <status|link|unlink> [--repo path|--global] [--targets agents,grok] [--dry-run] [--json] — mirror .claude/skills into the dirs other harnesses read');
-      console.error('       coord.js sim <list|acquire|release> [--for purpose] [--platform ios|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
+      console.error('       coord.js sim <list|acquire|release> [--for purpose] [--platform ios|watchos|android] [--bundle-id id] [--name pref] [--key udid|avd] [--keep-booted]');
       console.error('       coord.js device install <path/to/App.app> [--udid UDID] [--launch bundleId] [--timeout-min 30] — install on a paired iPhone, waiting while it is locked or unplugged');
       console.error('       coord.js ledger <add|list|show|take|note|dates|block|unblock|done|drop> [--repo .|all|path] [--title "…"] [--points-at ref] [--status …] [--priority low|normal|high|urgent] [--depends-on id1,id2] [--due YYYY-MM-DD|none] [--not-before YYYY-MM-DD|none] [--mine] [--notes] — list omits notes; show <id> prints them');
       console.error('       coord.js test <submit|status|list|line|watch|cancel> [--json] — list shows the whole queue; line --session <name> prints the status-line segment');

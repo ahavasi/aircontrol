@@ -9,7 +9,7 @@ const ACTIVE = new Set(['starting', 'running', 'cleaning']);
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'blocked', 'timed_out']);
 const KINDS = ['build', 'ios-test', 'ios-test-only'];
 const MAX_RUN_MS = { build: 20 * 60 * 1000, 'ios-test': 45 * 60 * 1000, 'ios-test-only': 45 * 60 * 1000 };
-const DEFAULTS = { stallTimeoutMs: 10 * 60 * 1000, maxRunMs: MAX_RUN_MS, enabled: false, overlap: false, maxXcode: 1, maxSimulators: 1, jobs: 4, jobsSolo: null, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'], bootTimeoutMs: 5 * 60 * 1000 };
+const DEFAULTS = { stallTimeoutMs: 10 * 60 * 1000, maxRunMs: MAX_RUN_MS, enabled: false, overlap: false, maxXcode: 1, maxSimulators: 1, jobs: 4, jobsSolo: null, runtime: 'iOS 26.5', allowedNames: ['Aircontrol-Agent'], watchRuntime: null, watchNames: ['Aircontrol-Agent-Watch'], protectedDevices: [], runnerScripts: ['scripts/verify.mjs'], bootTimeoutMs: 5 * 60 * 1000 };
 const simulatorJob = (kind) => ['ios-test', 'ios-test-only'].includes(kind);
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const root = (C) => path.join(path.dirname(C.configFile()), 'test-jobs');
@@ -37,7 +37,8 @@ function config(C) {
   }
   if (result.jobsSolo === null || result.jobsSolo === undefined) result.jobsSolo = Math.max(result.jobs, os.cpus().length - 2);
   else if (!Number.isInteger(result.jobsSolo) || result.jobsSolo < 1) throw new Error('testing.jobsSolo must be a positive integer');
-  for (const key of ['allowedNames', 'protectedDevices', 'runnerScripts']) {
+  if (result.watchRuntime !== null && (typeof result.watchRuntime !== 'string' || !result.watchRuntime)) throw new Error('testing.watchRuntime must be a runtime name such as "watchOS 27.0", or null for any watchOS runtime');
+  for (const key of ['allowedNames', 'watchNames', 'protectedDevices', 'runnerScripts']) {
     if (!Array.isArray(result[key]) || !result[key].every((s) => typeof s === 'string' && s)) throw new Error('invalid testing.' + key);
   }
   return result;
@@ -154,10 +155,22 @@ async function withLock(C, fn) {
   error.code = 'AIRCONTROL_QUEUE_BUSY';
   throw error;
 }
+// simctl lists every Apple simulator under one platform; the OS is read off the runtime.
+function simOs(device) {
+  if (device.os) return device.os;
+  const m = /^(watchOS|tvOS|visionOS|xrOS)\b/.exec(String(device.runtime || ''));
+  return m ? m[1] : 'iOS';
+}
+// The watchOS pool is a separate list so a queued iOS test can never be handed a Watch.
 function deviceAllowed(device, cfg, opts = {}) {
-  return device.platform === 'ios' && device.runtime === (opts.runtime || cfg.runtime) &&
-    cfg.allowedNames.includes(device.name) && !cfg.protectedDevices.some((s) => s === device.key || s === device.name) &&
-    (!opts.name || device.name === opts.name);
+  if (device.platform !== 'ios' || cfg.protectedDevices.some((s) => s === device.key || s === device.name)) return false;
+  if (opts.name && device.name !== opts.name) return false;
+  const os = simOs(device);
+  if (os === 'watchOS') {
+    const runtime = opts.runtime || cfg.watchRuntime;
+    return cfg.watchNames.includes(device.name) && (!runtime || device.runtime === runtime);
+  }
+  return os === 'iOS' && device.runtime === (opts.runtime || cfg.runtime) && cfg.allowedNames.includes(device.name);
 }
 // A pool device whose boot hung twice is benched until an operator resets it: assigning it
 // again would park the next job in the same hang.
@@ -303,7 +316,7 @@ function prepareJob(C, opts, session, deps = {}) {
   if (!deps.allowCommand) validateCommand(opts.command, opts.kind, cwd, cfg);
   if (simulatorJob(opts.kind)) {
     const devices = (deps.listDevices || (() => C.listDevices('ios')))();
-    if (!devices.some((d) => deviceAllowed(d, cfg, opts))) throw new Error('no compatible allowed agent device; configure an exact device name and runtime');
+    if (!devices.some((d) => simOs(d) === 'iOS' && deviceAllowed(d, cfg, opts))) throw new Error('no compatible allowed agent device; configure an exact device name and runtime');
   }
     const id = 'test_' + crypto.randomBytes(8).toString('hex');
     return { id, state: 'queued', kind: opts.kind, command: opts.command, cwd,
@@ -1114,6 +1127,8 @@ async function cli(C, argv) {
     }
     if (args.runtime) testing.runtime = args.runtime;
     if (args.devices) testing.allowedNames = args.devices.split(',').map((s) => s.trim()).filter(Boolean);
+    if (args['watch-runtime'] !== undefined) testing.watchRuntime = ['any', 'null', ''].includes(String(args['watch-runtime'])) ? null : String(args['watch-runtime']);
+    if (args['watch-devices']) testing.watchNames = args['watch-devices'].split(',').map((s) => s.trim()).filter(Boolean);
     if (args.protected) testing.protectedDevices = args.protected.split(',').map((s) => s.trim()).filter(Boolean);
     atomic(C.configFile(), { ...current, testing });
     console.log(JSON.stringify(testing)); return;
@@ -1159,7 +1174,7 @@ async function cli(C, argv) {
   if (args.json) console.log(JSON.stringify(result));
   else for (const j of Array.isArray(result) ? result : [result]) console.log(`${j.id} ${j.state} owner=${j.ownerName} queue=${j.queuePosition || '-'} device=${j.device?.key || '-'} phase=${j.phase || '-'}${j.waitReason ? ' waiting="' + j.waitReason + '"' : ''}${formatProgress(j) ? ' progress="' + formatProgress(j) + '"' : ''} log=${j.log}${j.error ? ' error=' + j.error : ''}${j.forcedBy ? ' forced-by=' + j.forcedBy.name : ''}`);
 }
-module.exports = { liveness, runnerAlive, jobGroupAlive, lastOutputAt, sweep, reap, externalBuildList, ensureRunner, heartbeatFile, RUNNER_STALE_MS, bootDevice, work, execute, unhealthyDevices, markUnhealthy, clearUnhealthy, poolUnhealthy, waitReason, capacityBlock, jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
+module.exports = { simOs, liveness, runnerAlive, jobGroupAlive, lastOutputAt, sweep, reap, externalBuildList, ensureRunner, heartbeatFile, RUNNER_STALE_MS, bootDevice, work, execute, unhealthyDevices, markUnhealthy, clearUnhealthy, poolUnhealthy, waitReason, capacityBlock, jobsFor, report, renderReport, forecast, snapshot, jobLabel, statuslineSummary, writeStatusline, renderStatusSegment, renderList, statuslineFile, emptyProgress, parseProgress, fingerprint, recordHistory, estimate, formatProgress, renderTestsLine, renderEvent, watch, DEFAULTS, ACTIVE, TERMINAL, root, file, config, jobs, atomic, lock, lockEntries, maintenanceActive, identity, alive, groupAlive, deviceAllowed, activeLease, capacity, dependencyState, resourceBusy, chooseJob, submitPipeline, validateCommand, commandForJob, submit, status, cancel, cleanup, tick, cli, dispatch };
 if (require.main === module) {
   const C = require('./coord.js');
   const run = process.argv[2] === 'work' ? work(C, process.argv[3]) : dispatch(C);

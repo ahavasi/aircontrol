@@ -50,6 +50,15 @@ session-id prefix.
   device that already has that app's data installed. `sim list` shows who holds what.
   Gate every later step on the grant (`… sim acquire … | grep -q '^leased' || exit 1`):
   a denial prints `DENIED` and the next chained command still runs.
+- **An Apple Watch simulator is leased the same way**, with `--platform watchos` (or
+  `--name <watch device>`): `node ~/.claude/hooks/coord.js sim acquire --session <your-name> --platform watchos --for "<what>"`.
+  The lease then covers `simctl boot|install|launch|io|shutdown` on that UDID and `sim release`
+  shuts it down. Only names in `testing.watchNames` (default `Aircontrol-Agent-Watch`) are
+  leasable while the test queue is enabled; `testing.watchRuntime` pins a watchOS runtime (default:
+  any). A Watch lease counts against `maxSimulators`, so release an iPhone lease first or raise it.
+  If no Watch pool device exists, create one with `xcrun simctl create Aircontrol-Agent-Watch
+  <watch device type> <watchOS runtime>` (creating is not lease-gated), then acquire it. Never ask the
+  user to boot or shut down a Watch simulator by hand.
 - **Release the device when you are done with it, not at some later cleanup** —
   `node ~/.claude/hooks/coord.js sim release --session <your-name>` shuts it down and hands it back in one
   step (`--keep-booted` opts out for a handoff). A real session end does the same for anything
