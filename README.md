@@ -307,7 +307,7 @@ What differs from the other two:
 | `who [--assignable] [--json]` | List live sessions grouped by repo; `--assignable` shows only sessions with no declared intent and no claims (`--idle` is a back-compat alias) |
 | `names [goofy\|animal\|real]` | Show or set the session name style |
 | `doctor [--roots dir1,dir2] [--min-age-minutes N] [--repair]` | Diagnose stale Git index locks; remove only safely classified locks when repair is explicit |
-| `sim <list\|acquire\|release> [--for "…"] [--platform ios\|android] [--bundle-id id] [--name pref] [--key udid\|avd]` | Lease a simulator or emulator exclusively |
+| `sim <list\|acquire\|release> [--for "…"] [--platform ios\|watchos\|android] [--bundle-id id] [--name pref] [--key udid\|avd]` | Lease a simulator or emulator exclusively |
 | `device install <App.app> [--udid UDID] [--launch bundleId] [--timeout-min 30]` | Install a built app on a paired iPhone via `devicectl`; while the phone is locked or unplugged it waits (one line per state change, retry every 20 s) instead of failing |
 | `ledger <add\|list\|show\|take\|drop\|note\|block\|unblock\|done> [--repo .\|all\|path] [--priority low\|normal\|high\|urgent] [--depends-on id1,id2] [--notes]` | Track open work across every repo on the machine. `list` prints titles and pointers; `--notes` or `show <id>` for the notes |
 | `handoff --session <me> --to <them> [--ledger-id id] [--note "…"]` | Transfer in-progress work: ledger ownership, claims, and a context note move to the recipient |
@@ -379,6 +379,14 @@ node ~/.claude/hooks/coord.js sim release --session captain-boopsnoot
 # shut down and released 1 lease held by captain-boopsnoot; Simulator.app quit
 ```
 
+- **Apple Watch.** `--platform watchos` leases a watchOS simulator (an explicit `--name` of a
+  Watch device works too); a plain or `--platform ios` acquire never lands on one. The lease lives
+  in the same simulator namespace, so the guard, `sim release` and `maxSimulators` treat it like an
+  iPhone. With the test queue enabled the Watch pool is `testing.watchNames` (default
+  `Aircontrol-Agent-Watch`) on `testing.watchRuntime` (default `null`, any watchOS runtime), set with
+  `test configure --watch-devices <names> --watch-runtime "watchOS 27.0"` (`any` clears it). Queued
+  test jobs stay on the iOS pool. aircontrol does not create pool devices:
+  `xcrun simctl create Aircontrol-Agent-Watch <watch device type> <watchOS runtime>`.
 - **Always a UDID, never a device name.** A name-based `-destination` resolves against
   `OS:latest`, and when that runtime holds no matching device `xcodebuild` executes **zero
   tests** and still exits 0.

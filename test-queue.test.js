@@ -893,3 +893,75 @@ test('end to end: the dispatcher reaps a job whose runner was killed and runs th
     assert.equal(Q.status(C, next.id, deps).state, 'succeeded');
   } finally { runner.kill(); }
 });
+
+const watch = { platform: 'ios', name: 'Aircontrol-Agent-Watch', key: 'C717BD44-C96F-4A86-960E-74F41176E4AD', runtime: 'watchOS 27.0', state: 'shutdown' };
+const watchDeps = { ...deps, listIos: () => [device, watch], listAndroid: () => [] };
+function guardStdout(input) {
+  const write = process.stdout.write;
+  let out = '';
+  process.stdout.write = (chunk) => { out += chunk; return true; };
+  try { C.cmdGuard(input, Date.now()); } finally { process.stdout.write = write; }
+  return out;
+}
+test('simctl watchOS runtimes parse to a watchOS device', () => {
+  const parsed = C.parseSimctlDevices(JSON.stringify({ devices: {
+    'com.apple.CoreSimulator.SimRuntime.watchOS-27-0': [{ udid: watch.key, name: watch.name, state: 'Shutdown', isAvailable: true }],
+    'com.apple.CoreSimulator.SimRuntime.iOS-26-5': [{ udid: device.key, name: device.name, state: 'Booted', isAvailable: true }],
+  } }));
+  assert.deepEqual(parsed.map((d) => [d.runtime, d.os, d.platform]), [['watchOS 27.0', 'watchOS', 'ios'], ['iOS 26.5', 'iOS', 'ios']]);
+  assert.equal(Q.simOs({ runtime: 'iOS 26.5' }), 'iOS');
+});
+test('the watchOS pool is its own name list and runtime, and leaves the iOS pool unchanged', () => {
+  setup();
+  const cfg = Q.config(C);
+  assert.deepEqual(cfg.watchNames, ['Aircontrol-Agent-Watch']);
+  assert.equal(cfg.watchRuntime, null);
+  assert.equal(Q.deviceAllowed(watch, cfg), true);
+  assert.equal(Q.deviceAllowed({ ...watch, runtime: 'watchOS 11.0' }, cfg), true);
+  assert.equal(Q.deviceAllowed({ ...watch, name: 'Apple Watch Ultra 2 (49mm)' }, cfg), false);
+  assert.equal(Q.deviceAllowed(watch, { ...cfg, watchRuntime: 'watchOS 26.0' }), false);
+  assert.equal(Q.deviceAllowed(watch, { ...cfg, protectedDevices: [watch.key] }), false);
+  assert.equal(Q.deviceAllowed({ ...watch, name: 'Aircontrol-Agent' }, cfg), false);
+  assert.equal(Q.deviceAllowed(device, cfg), true);
+  assert.equal(Q.deviceAllowed({ ...device, name: watch.name }, cfg), false);
+  setup({ watchRuntime: 7 });
+  assert.throws(() => Q.config(C), /watchRuntime/);
+});
+test('--platform watchos leases the Watch; a plain iOS acquire never does', () => {
+  setup({ maxSimulators: 2 });
+  assert.equal(C.acquireDevice({ sessionId: 'phone', platform: 'ios', nowMs: Date.now() }, { ...deps, listIos: () => [watch] }).reason, 'no-devices');
+  assert.equal(C.acquireDevice({ sessionId: 'phone', nowMs: Date.now() }, { ...watchDeps, listIos: () => [watch] }).reason, 'no-devices');
+  const phone = C.acquireDevice({ sessionId: 'phone', platform: 'ios', nowMs: Date.now() }, watchDeps);
+  assert.equal(phone.device.key, device.key);
+  const wrist = C.acquireDevice({ sessionId: 'wrist', platform: 'watchos', nowMs: Date.now() }, watchDeps);
+  assert.equal(wrist.ok, true);
+  assert.equal(wrist.device.key, watch.key);
+  assert.equal(wrist.lease.platform, 'ios');
+  assert.equal(C.acquireDevice({ sessionId: 'wrist', platform: 'watchos', nowMs: Date.now() }, watchDeps).reused, true);
+  assert.equal(C.acquireDevice({ sessionId: 'third', platform: 'watchos', nowMs: Date.now() }, watchDeps).reason, 'host-capacity');
+});
+test('--name infers the Watch, maxSimulators counts it, and queued jobs never get it', () => {
+  setup();
+  const byName = C.acquireDevice({ sessionId: 'wrist', prefer: watch.name, nowMs: Date.now() }, watchDeps);
+  assert.equal(byName.device.key, watch.key);
+  assert.equal(C.acquireDevice({ sessionId: 'phone', platform: 'ios', nowMs: Date.now() }, watchDeps).reason, 'host-capacity');
+  C.releaseLease('ios', watch.key);
+  assert.equal(C.acquireDevice({ sessionId: 'q', platform: 'ios', prefer: watch.name, nowMs: Date.now(), queuedJob: 'test_00000000000000dd' }, watchDeps).reason, 'no-devices');
+});
+test('a Watch lease opens the simulator guard to its holder and release shuts it down', () => {
+  setup({ maxSimulators: 2 });
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'aircontrol-watch-'));
+  C.cmdRegister({ session_id: 'wrist-owner', cwd: repo }, Date.now());
+  C.cmdRegister({ session_id: 'bystander', cwd: repo }, Date.now());
+  const bash = (sid, command) => guardStdout({ session_id: sid, tool_name: 'Bash', tool_input: { command } });
+  for (const cmd of [`xcrun simctl boot ${watch.key}`, `xcrun simctl shutdown ${watch.key}`]) assert.match(bash('wrist-owner', cmd), /No lease held/);
+  assert.equal(C.acquireDevice({ sessionId: 'wrist-owner', platform: 'watchos', nowMs: Date.now() }, watchDeps).ok, true);
+  for (const cmd of [`xcrun simctl boot ${watch.key}`, `xcrun simctl install ${watch.key} App.app`, `xcrun simctl launch ${watch.key} com.example.watchkitapp`,
+    `xcrun simctl io ${watch.key} screenshot shot.png`, `xcrun simctl shutdown ${watch.key}`]) assert.equal(bash('wrist-owner', cmd), '', cmd);
+  assert.match(bash('bystander', `xcrun simctl boot ${watch.key}`), /leased to/);
+  const shut = [];
+  const result = C.shutdownAndReleaseLeases('wrist-owner', { listIos: () => [{ ...watch, state: 'booted' }], listAndroid: () => [], shutdownDevice: (lease) => { shut.push(lease.key); }, quitSimulator: () => true });
+  assert.deepEqual(shut, [watch.key]);
+  assert.equal(result.released.length, 1);
+  assert.equal(C.readLease('ios', watch.key), null);
+});
