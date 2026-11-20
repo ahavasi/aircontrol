@@ -93,8 +93,9 @@ Both limits are overridable in `~/.claude/agents/config.json`:
 The usual cause on a Mac is Xcode DerivedData. Xcode keys it by project path, so every
 throwaway worktree a session builds in leaves a multi-GB folder behind that Xcode never
 collects. `disk` lists the folders whose project no longer exists; `disk --prune` removes them.
-It never touches a folder without a project path (Xcode's shared caches, or one being created
-mid-build) or one under a path a live session has claimed.
+It never touches Xcode's shared `*.noindex` caches or a folder under a path a live session has
+claimed. A folder with no project path at all (one being created mid-build, or one whose build
+died before Xcode recorded it) is taken only after 24 hours idle.
 
 `disk` also covers what macOS leaves in `/tmp` until the next reboot:
 
@@ -105,17 +106,23 @@ mid-build) or one under a path a live session has claimed.
 - **Unowned build output** directly in `/tmp`, `/tmp/claude-<uid>` or `$TMPDIR`: an Xcode
   DerivedData root (`Build` + `ModuleCache.noindex` or `SourcePackages`) or a SwiftPM scratch dir
   (`workspace-state.json` + `checkouts`), idle for 24 hours and not under a claimed path.
+- **Build output inside linked worktrees**: DerivedData or SwiftPM roots (by the same shape, so the
+  logs agents keep beside them in `build/` stay), `.next` beside a `package.json`, and `.gradle`,
+  up to four levels deep. Taken when nothing inside has changed for 6 hours, git tracks none of
+  it, and no live session holds the worktree: none claims a path overlapping it and none is
+  rooted in it. A session rooted in a parent folder, such as the main checkout that nests
+  `.worktrees/`, does not hold it. The main checkout and `node_modules` are never touched.
 - **Loose files** at the top of those same roots (build and test logs, screenshots, dumps): regular
   files you own, untouched for 7 days, not `*.lock` / `*.pid`, and not a claimed path. One line
   per root with the count and total size.
 
 It also **reports** (never removes) linked git worktrees that nobody is using: no live session
-in them, nothing uncommitted, nothing that exists on no remote, and no git activity for 7 days.
+rooted in them, nothing uncommitted, nothing that exists on no remote, and no git activity for 7 days.
 It checks every repo a session has ever worked in, from the activity log. A forgotten worktree
 is where an agent's in-tree `-derivedDataPath build` quietly grows to 10 GB; the line prints its
 size and the `git worktree remove` command, and session-cleanup is where it normally goes.
 
-All windows are overridable: `{ "disk": { "sessionIdleMs": 3600000, "buildIdleMs": 86400000, "looseFileIdleMs": 604800000, "worktreeIdleMs": 604800000 } }`.
+All windows are overridable: `{ "disk": { "sessionIdleMs": 3600000, "buildIdleMs": 86400000, "looseFileIdleMs": 604800000, "worktreeIdleMs": 604800000, "worktreeBuildIdleMs": 21600000 } }`.
 
 Naming the offender isn't the same as fixing it, so the line pairs it with a general,
 offender-keyed remediation (`remediationHint`, also appended to `retro`'s ranked list) —
