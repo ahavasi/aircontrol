@@ -4030,7 +4030,11 @@ function worktreeWithBuildOutput() {
   fakeTree(path.join(wt.pushed, 'tracked-dd'));
   g(wt.pushed, ['add', 'tracked-dd']);
   g(wt.pushed, ['commit', '-q', '-m', 'tracked build-shaped dir']);
-  for (const w of [main, wt.pushed, wt.dirty, wt.live, wt.recent]) ageTree(w, now - 12 * 3600e3);
+  for (const w of [main, wt.pushed, wt.dirty, wt.live, wt.recent]) {
+    for (const top of ['ios', 'web', 'android', 'tracked-dd']) {
+      if (fs.existsSync(path.join(w, top))) ageTree(path.join(w, top), now - 12 * 3600e3);
+    }
+  }
   fs.utimesSync(path.join(wt.recent, 'ios', 'build', 'DerivedData', 'Build', 'x'), new Date(now), new Date(now));
   return { main, wt, now };
 }
